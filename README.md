@@ -17,10 +17,10 @@ A lightweight proxy service that uses Puppeteer with stealth mode to bypass Clou
 
 ```bash
 # Start both FlareSolverr and the proxy
-docker-compose up -d
+docker compose up -d
 
 # Check logs
-docker-compose logs -f
+docker compose logs -f
 ```
 
 ### Manual Setup
