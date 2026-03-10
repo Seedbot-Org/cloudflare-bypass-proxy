@@ -1,6 +1,6 @@
-# FlareSolverr Proxy
+# Cloudflare Bypass Proxy
 
-A lightweight proxy service for [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) that provides a simple REST API to bypass Cloudflare protection.
+A lightweight proxy service that uses Puppeteer with stealth mode to bypass Cloudflare protection, providing a simple REST API.
 
 ## Features
 

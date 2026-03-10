@@ -1,13 +1,13 @@
 {
-  "name": "flaresolverr-proxy",
+  "name": "cloudflare-bypass-proxy",
   "version": "1.0.0",
-  "description": "Proxy service for FlareSolverr to bypass Cloudflare protection",
+  "description": "Proxy service to bypass Cloudflare protection using Puppeteer",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "docker:build": "docker build -t flaresolverr-proxy .",
+    "docker:build": "docker build -t cloudflare-bypass-proxy .",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down"
   },
