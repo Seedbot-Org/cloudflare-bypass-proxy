@@ -47,6 +47,7 @@ class PuppeteerService {
 
             this.browser = await puppeteerExtra.default.launch({
                 headless: true,
+                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',

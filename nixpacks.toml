@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["chromium", "libnss3", "libatk-bridge2.0-0", "libdrm2", "libxkbcommon0", "libgbm1"]
+
+[phases.install]
+cmds = ["npm install -g pnpm", "pnpm install"]
+
+[phases.build]
+cmds = ["pnpm build"]
+
+[variables]
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+PUPPETEER_EXECUTABLE_PATH = "/nix/var/nix/profiles/default/bin/chromium"
