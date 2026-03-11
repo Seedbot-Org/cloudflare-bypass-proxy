@@ -14,13 +14,7 @@ A lightweight proxy service that uses Puppeteer with stealth mode to bypass Clou
 
 ### Manual Setup
 
-1. Start FlareSolverr:
-
-```bash
-docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-```
-
-2. Install dependencies, build, and run the proxy:
+1. Install dependencies, build, and run the proxy:
 
 ```bash
 pnpm install
