@@ -6,10 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js",
-    "docker:build": "docker build -t cloudflare-bypass-proxy .",
-    "docker:up": "docker-compose up -d",
-    "docker:down": "docker-compose down"
+    "start": "node dist/index.js"
   },
   "keywords": [
     "flaresolverr",

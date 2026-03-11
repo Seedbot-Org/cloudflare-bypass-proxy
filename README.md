@@ -9,28 +9,27 @@ A lightweight proxy service that uses Puppeteer with stealth mode to bypass Clou
 - Built-in Stake bet lookup endpoint
 - Optional API key authentication
 - Health check endpoints
-- Docker support
 
 ## Quick Start
-
-### Using Docker Compose (Recommended)
-
-```bash
-# Start both FlareSolverr and the proxy
-docker compose up -d
-
-# Check logs
-docker compose logs -f
-```
 
 ### Manual Setup
 
 1. Start FlareSolverr:
+
 ```bash
 docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
 ```
 
-2. Install dependencies and run the proxy:
+2. Install dependencies, build, and run the proxy:
+
+```bash
+pnpm install
+pnpm run build
+pnpm start
+```
+
+### Development
+
 ```bash
 pnpm install
 pnpm dev
@@ -87,27 +86,27 @@ Content-Type: application/json
 
 ## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | 3002 | Server port |
-| `FLARESOLVERR_URL` | http://localhost:8191/v1 | FlareSolverr endpoint |
-| `CORS_ORIGINS` | * | Allowed CORS origins (comma-separated) |
-| `REQUEST_TIMEOUT` | 60000 | Request timeout in ms |
-| `MAX_TIMEOUT` | 120000 | Max timeout in ms |
-| `API_KEY` | (empty) | Optional API key for auth |
+| Variable           | Default                  | Description                            |
+| ------------------ | ------------------------ | -------------------------------------- |
+| `PORT`             | 3002                     | Server port                            |
+| `FLARESOLVERR_URL` | http://localhost:8191/v1 | FlareSolverr endpoint                  |
+| `CORS_ORIGINS`     | \*                       | Allowed CORS origins (comma-separated) |
+| `REQUEST_TIMEOUT`  | 60000                    | Request timeout in ms                  |
+| `MAX_TIMEOUT`      | 120000                   | Max timeout in ms                      |
+| `API_KEY`          | (empty)                  | Optional API key for auth              |
 
 ## Usage in seedbot-backend
 
 Update your `StakeVerifier` to call this proxy instead of ScraperAPI:
 
 ```typescript
-const response = await fetch('http://localhost:3002/api/proxy/stake/bet', {
-  method: 'POST',
+const response = await fetch("http://localhost:3002/api/proxy/stake/bet", {
+  method: "POST",
   headers: {
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
     // 'x-api-key': 'your-api-key', // If API_KEY is set
   },
-  body: JSON.stringify({ betId: 'house:123456789' }),
+  body: JSON.stringify({ betId: "house:123456789" }),
 });
 
 const result = await response.json();
