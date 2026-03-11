@@ -45,7 +45,8 @@ class PuppeteerService {
 
             puppeteerExtra.default.use(StealthPlugin.default());
 
-            this.browser = await puppeteerExtra.default.launch({
+            const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+            const launchOptions = {
                 headless: true,
                 executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
                 args: [
@@ -56,7 +57,10 @@ class PuppeteerService {
                     '--disable-gpu',
                     '--window-size=1920,1080',
                 ],
-            });
+                ...(executablePath ? { executablePath } : {}),
+            };
+
+            this.browser = await puppeteerExtra.default.launch(launchOptions);
 
             this.page = await this.browser.newPage();
 
