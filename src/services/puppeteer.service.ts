@@ -75,6 +75,20 @@ class PuppeteerService {
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
 		puppeteerExtra.default.use(StealthPlugin.default());
 
+		// Residential proxy via env — required in datacenter environments (Railway, Render, etc.)
+		// Cloudflare blocks datacenter IPs regardless of stealth headers.
+		// Set RESIDENTIAL_PROXY_URL=http://user:pass@proxy-host:port
+		// Recommended: Webshare (residential), Oxylabs, Smartproxy, Bright Data
+		const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
+		console.log('🚀 ~ PuppeteerService ~ _init ~ proxyUrl:', proxyUrl);
+		const proxyArgs = proxyUrl ? [`--proxy-server=${proxyUrl}`] : [];
+
+		if (proxyUrl) {
+			logger.info({ proxy: proxyUrl.replace(/:([^:@]+)@/, ':***@') }, 'Using residential proxy');
+		} else {
+			logger.warn('No RESIDENTIAL_PROXY_URL — datacenter IP may be blocked by Cloudflare');
+		}
+
 		this.browser = await puppeteerExtra.default.launch({
 			headless: true,
 			executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -92,6 +106,7 @@ class PuppeteerService {
 				'--no-first-run',
 				'--window-size=1280,720',
 				'--js-flags=--max-old-space-size=128',
+				...proxyArgs,
 			],
 		});
 
