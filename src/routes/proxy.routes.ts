@@ -15,12 +15,10 @@ router.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
-// Simple sliding-window per IP.
 
 const RATE_LIMIT = { MAX: 30, WINDOW_MS: 60_000 };
 const ipHits = new Map<string, { count: number; windowStart: number }>();
 
-// Purge expired entries every 5 minutes
 setInterval(() => {
 	const now = Date.now();
 	for (const [ip, entry] of ipHits) {
@@ -51,23 +49,18 @@ router.use((req: Request, res: Response, next: NextFunction) => {
 
 function validateBody(body: Record<string, unknown>): string | null {
 	const { url, query, variables } = body;
-
 	if (typeof url !== 'string' || !url.startsWith('https://')) return 'url must be a valid HTTPS URL';
-
 	if (typeof query !== 'string' || !query.trim()) return 'query must be a non-empty string';
-
 	if (query.length > 10_000) return 'query exceeds max length of 10,000 characters';
-
 	if (variables !== undefined) {
 		if (typeof variables !== 'object' || Array.isArray(variables)) return 'variables must be an object';
 		if (JSON.stringify(variables).length > 5_000) return 'variables exceeds max size of 5,000 characters';
 	}
-
 	return null;
 }
 
 // ─── Deduplication ────────────────────────────────────────────────────────────
-// Coalesces identical concurrent requests
+// Coalesces identical concurrent requests — prevents hammering Puppeteer
 
 const inFlight = new Map<string, Promise<unknown>>();
 
@@ -77,13 +70,9 @@ function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
 		logger.debug({ key }, 'Deduplicating in-flight request');
 		return existing as Promise<T>;
 	}
-
 	const promise = fn().finally(() => inFlight.delete(key));
 	inFlight.set(key, promise);
-
-	// Safety eviction in case the promise never settles
-	setTimeout(() => inFlight.delete(key), 10_000).unref();
-
+	setTimeout(() => inFlight.delete(key), 10_000).unref(); // safety eviction
 	return promise;
 }
 
@@ -109,34 +98,29 @@ router.post('/graphql', async (req: Request, res: Response) => {
 /** POST /api/proxy/stake/bet — Stake bet lookup */
 router.post('/stake/bet', async (req: Request, res: Response) => {
 	const { betId } = req.body;
-
-	if (!betId) {
-		return res.status(400).json({ success: false, error: 'betId is required' });
-	}
+	if (!betId) return res.status(400).json({ success: false, error: 'betId is required' });
 
 	const query = `
-        query LimboPreview($iid: String!) {
-            bet(iid: $iid) {
-                id iid
-                bet {
-                    ... on CasinoBet {
-                        ...CasinoBet
-                        state { ...CasinoGameLimbo __typename }
-                        __typename
-                    }
-                    __typename
-                }
-                __typename
-            }
-        }
-        fragment CasinoBet on CasinoBet {
-            id active payoutMultiplier amountMultiplier amount payout updatedAt currency game
-            user { id name __typename }
-        }
-        fragment CasinoGameLimbo on CasinoGameLimbo {
-            result multiplierTarget
-        }
-    `;
+		query LimboPreview($iid: String!) {
+			bet(iid: $iid) {
+				id iid
+				bet {
+					... on CasinoBet {
+						...CasinoBet
+						state { ...CasinoGameLimbo __typename }
+						__typename
+					}
+					__typename
+				}
+				__typename
+			}
+		}
+		fragment CasinoBet on CasinoBet {
+			id active payoutMultiplier amountMultiplier amount payout updatedAt currency game
+			user { id name __typename }
+		}
+		fragment CasinoGameLimbo on CasinoGameLimbo { result multiplierTarget }
+	`;
 
 	logger.info({ betId }, 'Stake bet lookup');
 
@@ -146,10 +130,15 @@ router.post('/stake/bet', async (req: Request, res: Response) => {
 			query,
 			variables: { iid: betId },
 			operationName: 'LimboPreview',
-		}),
+		})
 	).catch((err) => ({ success: false, error: err instanceof Error ? err.message : 'Internal error' }));
 
 	res.status((result as { success: boolean }).success ? 200 : 500).json(result);
+});
+
+/** GET /api/proxy/stats — pool health */
+router.get('/stats', (_req: Request, res: Response) => {
+	res.json(puppeteerService.getStats());
 });
 
 export { router as proxyRouter };

@@ -3,7 +3,6 @@ import { logger } from '../logger';
 
 // ─── Mirror Registry ──────────────────────────────────────────────────────────
 
-// All known Stake mirrors
 export const STAKE_MIRRORS = [
 	'https://stake.ac',
 	'https://stake.games',
@@ -25,28 +24,32 @@ export const STAKE_MIRRORS = [
 
 // ─── CF Detection ─────────────────────────────────────────────────────────────
 
-// All known Cloudflare challenge page signals — title and body text variants.
-const CF_CHALLENGE_SIGNALS = [
-	'Just a moment',
-	'Performing security verification',
-	'Verifying you are human',
-	'Please wait',
-	'Checking your browser',
-	'DDoS protection by Cloudflare',
+// Ordered by how commonly they appear — short-circuits faster
+const CF_SIGNALS = [
+	'just a moment',
+	'checking your browser',
+	'verifying you are human',
+	'performing security verification',
+	'please wait',
+	'ddos protection by cloudflare',
 	'cf-browser-verification',
 	'cf_chl_opt',
 ] as const;
 
+// Pre-built lowercase array — avoids re-allocating on every check
+const CF_SIGNALS_LOWER = CF_SIGNALS.map((s) => s.toLowerCase());
+
 function isCloudflareChallenge(title: string, bodyText: string): boolean {
 	const haystack = `${title} ${bodyText}`.toLowerCase();
-	return CF_CHALLENGE_SIGNALS.some((signal) => haystack.includes(signal.toLowerCase()));
+	return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
 }
 
 async function isPageBlockedByCF(page: Page): Promise<boolean> {
 	try {
 		const { title, bodyText } = await page.evaluate(() => ({
 			title: document.title,
-			bodyText: document.body?.innerText?.slice(0, 2000) ?? '',
+			// Only grab first 1000 chars — CF signals are always near the top
+			bodyText: document.body?.innerText?.slice(0, 1000) ?? '',
 		}));
 		return isCloudflareChallenge(title, bodyText);
 	} catch {
@@ -54,7 +57,7 @@ async function isPageBlockedByCF(page: Page): Promise<boolean> {
 	}
 }
 
-// ─── Mirror Status Tracking ───────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export type MirrorStatus = 'unknown' | 'healthy' | 'blocked' | 'unreachable';
 
@@ -62,103 +65,92 @@ export interface MirrorState {
 	origin: string;
 	status: MirrorStatus;
 	lastChecked: number;
-	blockedUntil: number; // Don't retry before this timestamp
+	blockedUntil: number;
 	failCount: number;
 }
 
-// How long to avoid a blocked mirror before trying it again (exponential backoff)
-const BASE_BACKOFF_MS = 2 * 60_000; // 2 minutes base
-const MAX_BACKOFF_MS = 30 * 60_000; // 30 minutes max
+// ─── Backoff ──────────────────────────────────────────────────────────────────
+
+const BASE_BACKOFF_MS = 2 * 60_000; // 2 min
+const MAX_BACKOFF_MS = 30 * 60_000; // 30 min cap
 
 function backoffMs(failCount: number): number {
-	return Math.min(BASE_BACKOFF_MS * Math.pow(2, failCount - 1), MAX_BACKOFF_MS);
+	return Math.min(BASE_BACKOFF_MS * 2 ** (failCount - 1), MAX_BACKOFF_MS);
 }
 
 // ─── Mirror Router ────────────────────────────────────────────────────────────
 
 export class MirrorRouter {
-	private mirrors: Map<string, MirrorState>;
+	private readonly mirrors: Map<string, MirrorState>;
 
 	constructor(mirrors: readonly string[] = STAKE_MIRRORS) {
 		this.mirrors = new Map(mirrors.map((origin) => [origin, { origin, status: 'unknown', lastChecked: 0, blockedUntil: 0, failCount: 0 }]));
 	}
 
-	// ─── Mirror Selection ──────────────────────────────────────────────────────
+	// ─── Selection ────────────────────────────────────────────────────────────
 
-	/**
-	 * Returns mirrors in priority order, skipping ones that are currently
-	 * on cooldown due to recent CF blocks.
-	 */
 	getAvailableMirrors(): string[] {
 		const now = Date.now();
+		// Rank: healthy=0, unknown=1, everything else=2
+		const rank = (s: MirrorStatus) => (s === 'healthy' ? 0 : s === 'unknown' ? 1 : 2);
 
 		return [...this.mirrors.values()]
 			.filter((m) => now >= m.blockedUntil)
-			.sort((a, b) => {
-				// Prefer known-healthy > unknown > known-blocked (past cooldown)
-				const rank = (s: MirrorStatus) => (s === 'healthy' ? 0 : s === 'unknown' ? 1 : 2);
-				return rank(a.status) - rank(b.status);
-			})
+			.sort((a, b) => rank(a.status) - rank(b.status))
 			.map((m) => m.origin);
 	}
 
-	// ─── Status Updates ────────────────────────────────────────────────────────
+	// ─── Status Updates ───────────────────────────────────────────────────────
 
 	markHealthy(origin: string): void {
-		const state = this.mirrors.get(origin);
-		if (!state) return;
-		state.status = 'healthy';
-		state.failCount = 0;
-		state.blockedUntil = 0;
-		state.lastChecked = Date.now();
-		logger.debug({ origin }, 'Mirror marked healthy');
+		const s = this.mirrors.get(origin);
+		if (!s) return;
+		s.status = 'healthy';
+		s.failCount = 0;
+		s.blockedUntil = 0;
+		s.lastChecked = Date.now();
 	}
 
 	markBlocked(origin: string): void {
-		const state = this.mirrors.get(origin);
-		if (!state) return;
-		state.failCount++;
-		state.status = 'blocked';
-		state.blockedUntil = Date.now() + backoffMs(state.failCount);
-		state.lastChecked = Date.now();
-		logger.warn({ origin, failCount: state.failCount, cooldownMs: backoffMs(state.failCount) }, 'Mirror blocked by CF — cooling down');
+		const s = this.mirrors.get(origin);
+		if (!s) return;
+		s.failCount++;
+		s.status = 'blocked';
+		s.blockedUntil = Date.now() + backoffMs(s.failCount);
+		s.lastChecked = Date.now();
+		logger.warn({ origin, failCount: s.failCount, cooldownMs: backoffMs(s.failCount) }, 'Mirror CF-blocked');
 	}
 
 	markUnreachable(origin: string): void {
-		const state = this.mirrors.get(origin);
-		if (!state) return;
-		state.failCount++;
-		state.status = 'unreachable';
-		state.blockedUntil = Date.now() + backoffMs(state.failCount);
-		state.lastChecked = Date.now();
-		logger.warn({ origin }, 'Mirror unreachable — cooling down');
+		const s = this.mirrors.get(origin);
+		if (!s) return;
+		s.failCount++;
+		s.status = 'unreachable';
+		s.blockedUntil = Date.now() + backoffMs(s.failCount);
+		s.lastChecked = Date.now();
+		logger.warn({ origin, failCount: s.failCount }, 'Mirror unreachable');
 	}
 
 	getStats(): Record<string, Pick<MirrorState, 'status' | 'failCount' | 'blockedUntil'>> {
 		const out: Record<string, Pick<MirrorState, 'status' | 'failCount' | 'blockedUntil'>> = {};
-		for (const [origin, state] of this.mirrors) {
-			out[origin] = { status: state.status, failCount: state.failCount, blockedUntil: state.blockedUntil };
+		for (const [origin, s] of this.mirrors) {
+			out[origin] = { status: s.status, failCount: s.failCount, blockedUntil: s.blockedUntil };
 		}
 		return out;
 	}
 
-	// ─── CF Bypass with Fallback ───────────────────────────────────────────────
+	// ─── CF Bypass ────────────────────────────────────────────────────────────
 
 	/**
-	 * Tries each available mirror in order until one passes the CF challenge.
-	 * Returns the first clean mirror origin, or throws if all are blocked.
-	 *
-	 * @param page     - Puppeteer page to navigate on
-	 * @param timeout  - Per-mirror navigation timeout in ms
+	 * Tries available mirrors in priority order until one is CF-clean.
+	 * Returns the origin of the first working mirror.
 	 */
-	async findCleanMirror(page: Page, timeout = 45_000): Promise<string> {
+	async findCleanMirror(page: Page, timeout = 30_000): Promise<string> {
 		const available = this.getAvailableMirrors();
 
 		if (available.length === 0) {
-			throw new Error('All mirrors are currently on cooldown');
+			throw new Error('All mirrors are on cooldown');
 		}
-
-		logger.info({ count: available.length }, 'Searching for clean mirror...');
 
 		for (const origin of available) {
 			const result = await this._tryMirror(page, origin, timeout);
@@ -169,62 +161,34 @@ export class MirrorRouter {
 				return origin;
 			}
 
-			if (result === 'blocked') {
-				this.markBlocked(origin);
-			} else {
-				this.markUnreachable(origin);
-			}
+			result === 'blocked' ? this.markBlocked(origin) : this.markUnreachable(origin);
 		}
 
 		throw new Error(`All ${available.length} mirrors are blocked or unreachable`);
 	}
 
-	/**
-	 * Navigates to an origin and checks if it's behind a CF challenge.
-	 * Returns: 'clean' | 'blocked' | 'unreachable'
-	 */
 	private async _tryMirror(page: Page, origin: string, timeout: number): Promise<'clean' | 'blocked' | 'unreachable'> {
-		logger.debug({ origin }, 'Trying mirror...');
-
 		try {
 			await page.goto(origin, { waitUntil: 'domcontentloaded', timeout });
-
-			// Wait briefly for CF JS challenge to either resolve or stay stuck
-			await this._waitForCFResolution(page, 10_000);
-
-			const blocked = await isPageBlockedByCF(page);
-
-			if (blocked) {
-				logger.debug({ origin }, 'Mirror is CF-blocked');
-				return 'blocked';
-			}
-
-			return 'clean';
+			await this._waitForCFClear(page, 8_000);
+			return (await isPageBlockedByCF(page)) ? 'blocked' : 'clean';
 		} catch (err) {
-			logger.debug({ origin, err: (err as Error).message }, 'Mirror unreachable');
+			logger.debug({ origin, err: (err as Error).message }, 'Mirror nav failed');
 			return 'unreachable';
 		}
 	}
 
 	/**
-	 * Waits up to `timeout` ms for the page to clear a CF challenge.
-	 * Resolves early if the challenge disappears before the timeout.
+	 * Polls until CF signals disappear or timeout expires.
+	 * Avoids waitForFunction to skip serialising the signals array on every tick.
 	 */
-	private async _waitForCFResolution(page: Page, timeout: number): Promise<void> {
-		try {
-			await page.waitForFunction(
-				(signals: string[]) => {
-					const text = `${document.title} ${document.body?.innerText ?? ''}`.toLowerCase();
-					return !signals.some((s) => text.includes(s.toLowerCase()));
-				},
-				{ timeout, polling: 500 },
-				[...CF_CHALLENGE_SIGNALS]
-			);
-		} catch {
-			// Timed out waiting — page is likely still blocked
+	private async _waitForCFClear(page: Page, timeout: number): Promise<void> {
+		const deadline = Date.now() + timeout;
+		while (Date.now() < deadline) {
+			if (!(await isPageBlockedByCF(page))) return;
+			await new Promise((r) => setTimeout(r, 600));
 		}
 	}
 }
 
-// Singleton for use across the app
 export const mirrorRouter = new MirrorRouter();

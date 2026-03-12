@@ -18,38 +18,33 @@ export interface ProxyResponse {
 	timing?: { duration: number };
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-
 const CONFIG = {
 	POOL_SIZE: 3,
-	MAX_REQUESTS_PER_PAGE: 50,
-	PAGE_MAX_AGE_MS: 10 * 60_000,
-	REQUEST_TIMEOUT_MS: 30_000,
-	QUEUE_TIMEOUT_MS: 60_000,
-	CF_BYPASS_INTERVAL_MS: 5 * 60_000,
-	HEALTH_CHECK_INTERVAL_MS: 30_000,
-	HEAP_RECYCLE_THRESHOLD_MB: 512,
-	BROWSER_RESTART_DELAY_MS: 2_000,
+	MAX_REQUESTS_PER_PAGE: 100,
+	PAGE_MAX_AGE_MS: 15 * 60_000, // 15 min
+	REQUEST_TIMEOUT_MS: 15_000, // reduced from 30s — fail fast
+	QUEUE_TIMEOUT_MS: 30_000, // reduced from 60s
+	CF_BYPASS_INTERVAL_MS: 4 * 60_000, // slightly under CF session TTL
+	HEALTH_CHECK_INTERVAL_MS: 60_000, // every 1 min is enough
+	HEAP_RECYCLE_THRESHOLD_MB: 400,
+	BROWSER_RESTART_DELAY_MS: 1_000,
 } as const;
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface PooledPage {
 	page: Page;
 	busy: boolean;
 	requestCount: number;
 	createdAt: number;
-	lastBypassAt: Map<string, number>; // origin -> timestamp
-	activeMirror: string | null; // currently bypassed mirror origin
+	lastBypassAt: Map<string, number>;
+	activeMirror: string | null;
 }
 
 interface QueuedRequest {
 	request: GraphQLRequest;
 	resolve: (value: ProxyResponse) => void;
 	reject: (reason: unknown) => void;
+	timeoutId: NodeJS.Timeout;
 }
-
-// ─── Service ──────────────────────────────────────────────────────────────────
 
 class PuppeteerService {
 	private browser: Browser | null = null;
@@ -59,18 +54,17 @@ class PuppeteerService {
 	private initPromise: Promise<void> | null = null;
 	private shuttingDown = false;
 	private healthTimer: NodeJS.Timeout | null = null;
+	private restartTimer: NodeJS.Timeout | null = null;
 
-	// ─── Init ──────────────────────────────────────────────────────────────────
+	// ─── Init ─────────────────────────────────────────────────────────────────
 
 	async init(): Promise<void> {
 		if (this.initialized) return;
 		if (this.initPromise) return this.initPromise;
-
 		this.initPromise = this._init().catch((err) => {
 			this.initPromise = null;
 			throw err;
 		});
-
 		return this.initPromise;
 	}
 
@@ -91,10 +85,13 @@ class PuppeteerService {
 				'--disable-gpu',
 				'--disable-extensions',
 				'--disable-background-networking',
+				'--disable-background-timer-throttling',
+				'--disable-backgrounding-occluded-windows',
+				'--disable-renderer-backgrounding',
 				'--mute-audio',
 				'--no-first-run',
-				'--window-size=1920,1080',
-				'--js-flags=--max-old-space-size=256',
+				'--window-size=1280,720',
+				'--js-flags=--max-old-space-size=128',
 			],
 		});
 
@@ -112,23 +109,35 @@ class PuppeteerService {
 		logger.info(`Puppeteer ready (pool: ${CONFIG.POOL_SIZE})`);
 	}
 
-	// ─── Page Management ───────────────────────────────────────────────────────
+	// ─── Page Management ──────────────────────────────────────────────────────
 
 	private async _createPage(): Promise<PooledPage> {
 		if (!this.browser) throw new Error('Browser not initialized');
 
 		const page = await this.browser.newPage();
 
-		// Block resources not needed for GraphQL to reduce memory/CPU
+		// Aggressive resource blocking — only scripts + XHR needed for GraphQL
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
-			const blocked = ['image', 'stylesheet', 'font', 'media', 'websocket'];
-			blocked.includes(req.resourceType()) ? req.abort() : req.continue();
+			const type = req.resourceType();
+			if (type === 'document' || type === 'script' || type === 'xhr' || type === 'fetch') {
+				req.continue();
+			} else {
+				req.abort();
+			}
 		});
 
-		await page.setViewport({ width: 1920, height: 1080 });
-		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36');
+		// Prevent memory build-up from console logs
+		page.on('console', () => {});
+		page.on('pageerror', () => {});
+
+		await page.setViewport({ width: 1280, height: 720 });
+		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
 		await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+		// Cap JS execution time to prevent runaway scripts
+		await page.setDefaultTimeout(CONFIG.REQUEST_TIMEOUT_MS);
+		await page.setDefaultNavigationTimeout(CONFIG.REQUEST_TIMEOUT_MS);
 
 		const pooled: PooledPage = {
 			page,
@@ -143,34 +152,29 @@ class PuppeteerService {
 		return pooled;
 	}
 
-	private _isHealthy(pooled: PooledPage): boolean {
-		const tooOld = Date.now() - pooled.createdAt > CONFIG.PAGE_MAX_AGE_MS;
-		const worn = pooled.requestCount >= CONFIG.MAX_REQUESTS_PER_PAGE;
-		return !tooOld && !worn;
+	private _isHealthy(p: PooledPage): boolean {
+		return Date.now() - p.createdAt <= CONFIG.PAGE_MAX_AGE_MS && p.requestCount < CONFIG.MAX_REQUESTS_PER_PAGE;
 	}
 
 	private async _recyclePage(pooled: PooledPage): Promise<void> {
 		const idx = this.pool.indexOf(pooled);
 		if (idx === -1) return;
-
 		logger.debug(`Recycling page (requests: ${pooled.requestCount})`);
-		await pooled.page.close().catch(() => {});
 		this.pool.splice(idx, 1);
+		await pooled.page.close().catch(() => {});
 		await this._createPage();
 	}
 
 	private async _acquirePage(): Promise<PooledPage> {
 		await this.init();
 
-		// Prefer a free healthy page
 		const free = this.pool.find((p) => !p.busy && this._isHealthy(p));
 		if (free) {
 			free.busy = true;
 			return free;
 		}
 
-		// Recycle a free stale page
-		const stale = this.pool.find((p) => !p.busy && !this._isHealthy(p));
+		const stale = this.pool.find((p) => !p.busy);
 		if (stale) {
 			await this._recyclePage(stale);
 			const fresh = this.pool[this.pool.length - 1];
@@ -186,20 +190,17 @@ class PuppeteerService {
 		this._drainQueue();
 	}
 
-	// ─── Queue ─────────────────────────────────────────────────────────────────
+	// ─── Queue ────────────────────────────────────────────────────────────────
 
 	private _enqueue(request: GraphQLRequest): Promise<ProxyResponse> {
 		return new Promise((resolve, reject) => {
-			const item: QueuedRequest = { request, resolve, reject };
-			this.queue.push(item);
-
-			setTimeout(() => {
-				const idx = this.queue.indexOf(item);
-				if (idx !== -1) {
-					this.queue.splice(idx, 1);
-					reject(new Error('Request timed out in queue'));
-				}
+			const timeoutId = setTimeout(() => {
+				const idx = this.queue.findIndex((i) => i.timeoutId === timeoutId);
+				if (idx !== -1) this.queue.splice(idx, 1);
+				reject(new Error('Request timed out in queue'));
 			}, CONFIG.QUEUE_TIMEOUT_MS);
+
+			this.queue.push({ request, resolve, reject, timeoutId });
 		});
 	}
 
@@ -209,6 +210,7 @@ class PuppeteerService {
 			if (!free) break;
 
 			const item = this.queue.shift()!;
+			clearTimeout(item.timeoutId);
 			free.busy = true;
 
 			this._executeRequest(free, item.request)
@@ -218,132 +220,120 @@ class PuppeteerService {
 		}
 	}
 
-	// ─── Cloudflare Bypass with Mirror Fallback ──────────────────────────────
+	// ─── Cloudflare Bypass ────────────────────────────────────────────────────
 
-	/**
-	 * Ensures the page has a clean, CF-free mirror active.
-	 * If the current mirror is blocked, automatically rotates to the next one
-	 * and rewrites `request.url` to point at the working mirror.
-	 */
 	private async _bypassCloudflare(pooled: PooledPage, request: GraphQLRequest): Promise<void> {
-		const requestedOrigin = new URL(request.url).origin;
-		const lastBypass = pooled.lastBypassAt.get(requestedOrigin) ?? 0;
+		const origin = new URL(request.url).origin;
+		const lastBypass = pooled.lastBypassAt.get(origin) ?? 0;
 
-		// Still fresh — no navigation needed
-		if (pooled.activeMirror === requestedOrigin && Date.now() - lastBypass <= CONFIG.CF_BYPASS_INTERVAL_MS) {
-			return;
+		if (pooled.activeMirror === origin && Date.now() - lastBypass <= CONFIG.CF_BYPASS_INTERVAL_MS) {
+			return; // Still fresh, skip navigation
 		}
 
-		// Find a clean mirror (starts with the requested origin, falls back to others)
 		const cleanOrigin = await mirrorRouter.findCleanMirror(pooled.page);
 
-		// Give CF time to write its session cookies
-		await new Promise((r) => setTimeout(r, 1_500));
+		// Minimal wait — CF sets cookies during navigation, not after
+		await new Promise((r) => setTimeout(r, 800));
 
 		pooled.activeMirror = cleanOrigin;
 		pooled.lastBypassAt.set(cleanOrigin, Date.now());
 
-		// Rewrite the request URL to use the clean mirror
-		if (cleanOrigin !== requestedOrigin) {
-			const originalPath = request.url.replace(requestedOrigin, '');
-			request.url = `${cleanOrigin}${originalPath}`;
-			logger.info({ from: requestedOrigin, to: cleanOrigin }, 'Routed to mirror');
+		if (cleanOrigin !== origin) {
+			request.url = `${cleanOrigin}${request.url.replace(origin, '')}`;
+			logger.info({ from: origin, to: cleanOrigin }, 'Mirror rotated');
 		}
 	}
 
-	// ─── GraphQL Fetch ─────────────────────────────────────────────────────────
+	// ─── GraphQL Fetch ────────────────────────────────────────────────────────
 
 	private async _executeRequest(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
 		const start = Date.now();
-
 		await this._bypassCloudflare(pooled, request);
 		pooled.requestCount++;
 
-		const fetchResult = await Promise.race([
-			this._cdpFetch(pooled, request),
-			new Promise<ProxyResponse>((_, reject) =>
-				setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS)
-			),
-		]);
-
-		return { ...fetchResult, timing: { duration: Date.now() - start } };
+		try {
+			const result = await Promise.race([
+				this._cdpFetch(pooled, request),
+				new Promise<ProxyResponse>((_, reject) =>
+					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS)
+				),
+			]);
+			return { ...result, timing: { duration: Date.now() - start } };
+		} catch (err) {
+			const msg = (err as Error).message ?? '';
+			// Page was killed mid-request (browser crash race) — surface clearly
+			if (msg.includes('Target closed') || msg.includes('Session closed')) {
+				throw new Error('Page closed during request — browser may have crashed');
+			}
+			throw err;
+		}
 	}
 
 	private async _cdpFetch(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
+		if (pooled.page.isClosed()) {
+			throw new Error('Page is closed');
+		}
+
 		const headers: Record<string, string> = {
 			'Content-Type': 'application/json',
 			Accept: 'application/json',
-			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
 		};
 		if (request.accessToken) headers['x-access-token'] = request.accessToken;
 
 		const body = JSON.stringify({
 			query: request.query,
 			variables: request.variables ?? {},
-			operationName: request.operationName,
+			...(request.operationName && { operationName: request.operationName }),
 		});
 
-		// Use page.evaluate but with XMLHttpRequest instead of fetch —
-		// XHR inherits the page's cookie jar more reliably across CF setups
 		const result = await pooled.page.evaluate(
-			async ({ url, headers, body }) => {
-				return new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
+			({ url, headers, body }) =>
+				new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
 					const xhr = new XMLHttpRequest();
 					xhr.open('POST', url, true);
-
-					for (const [key, value] of Object.entries(headers)) {
-						xhr.setRequestHeader(key, value);
-					}
-
+					for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
+					xhr.timeout = 12_000;
 					xhr.onload = () => {
 						try {
-							resolve({ success: true, status: xhr.status, data: JSON.parse(xhr.responseText) });
+							resolve({ success: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: JSON.parse(xhr.responseText) });
 						} catch {
-							resolve({ success: false, status: xhr.status, error: 'Failed to parse response JSON' });
+							resolve({ success: false, status: xhr.status, error: 'Failed to parse JSON' });
 						}
 					};
-
 					xhr.onerror = () => resolve({ success: false, error: 'XHR network error' });
 					xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out' });
-
 					xhr.send(body);
-				});
-			},
+				}),
 			{ url: request.url, headers, body }
 		);
 
-		// If still blocked by CF, invalidate this mirror so next request rotates
 		if (result.status === 403 || result.status === 503) {
 			const origin = new URL(request.url).origin;
-			logger.warn({ status: result.status, origin }, 'CF block on active mirror — rotating on next request');
+			logger.warn({ status: result.status, origin }, 'CF block — rotating mirror');
 			pooled.lastBypassAt.delete(origin);
 			pooled.activeMirror = null;
 			mirrorRouter.markBlocked(origin);
-		} else {
-			// Confirm the mirror is healthy after a successful response
+		} else if (result.success) {
 			mirrorRouter.markHealthy(new URL(request.url).origin);
 		}
 
 		return result;
 	}
 
-	// ─── Public ────────────────────────────────────────────────────────────────
+	// ─── Public ───────────────────────────────────────────────────────────────
 
 	async graphqlRequest(request: GraphQLRequest): Promise<ProxyResponse> {
-		if (this.shuttingDown) {
-			return { success: false, error: 'Service is shutting down' };
-		}
+		if (this.shuttingDown) return { success: false, error: 'Service is shutting down' };
 
 		const start = Date.now();
 
 		try {
 			let pooled: PooledPage;
-
 			try {
 				pooled = await this._acquirePage();
 			} catch (err) {
 				if ((err as Error).message === 'POOL_EXHAUSTED') {
-					logger.debug('Pool exhausted — queuing request');
+					logger.debug('Pool exhausted — queuing');
 					return this._enqueue(request);
 				}
 				throw err;
@@ -372,43 +362,52 @@ class PuppeteerService {
 		};
 	}
 
-	// ─── Health Check ──────────────────────────────────────────────────────────
+	// ─── Health Check ─────────────────────────────────────────────────────────
 
 	private _startHealthCheck(): void {
 		this.healthTimer = setInterval(async () => {
 			const { heapMB, busyPages, queueLength } = this.getStats();
-			logger.debug({ heapMB, busyPages, queueLength }, 'Health check');
+			logger.debug({ heapMB, busyPages, queueLength }, 'Health');
 
 			if (heapMB > CONFIG.HEAP_RECYCLE_THRESHOLD_MB) {
-				logger.warn({ heapMB }, 'High memory — recycling oldest free page');
 				const oldest = this.pool.filter((p) => !p.busy).sort((a, b) => a.createdAt - b.createdAt)[0];
-				if (oldest) await this._recyclePage(oldest);
+				if (oldest) {
+					logger.warn({ heapMB }, 'High memory — recycling oldest page');
+					await this._recyclePage(oldest);
+				}
 			}
 		}, CONFIG.HEALTH_CHECK_INTERVAL_MS);
 
 		this.healthTimer.unref();
 	}
 
-	// ─── Crash Recovery ────────────────────────────────────────────────────────
+	// ─── Crash Recovery ───────────────────────────────────────────────────────
 
-	private async _restartBrowser(): Promise<void> {
-		this.initialized = false;
-		this.initPromise = null;
-		this.pool = [];
+	private _restartBrowser(): void {
+		if (this.restartTimer) return;
+		this.restartTimer = setTimeout(async () => {
+			this.restartTimer = null;
+			this.initialized = false;
+			this.initPromise = null;
 
-		for (const item of this.queue.splice(0)) {
-			item.reject(new Error('Browser crashed'));
-		}
+			for (const item of this.queue.splice(0)) {
+				clearTimeout(item.timeoutId);
+				item.reject(new Error('Browser crashed'));
+			}
 
-		await this.browser?.close().catch(() => {});
-		this.browser = null;
+			// Pages are already dead — just clear references, don't try to close them
+			this.pool = [];
+			await this.browser?.close().catch(() => {});
+			this.browser = null;
 
-		await new Promise((r) => setTimeout(r, CONFIG.BROWSER_RESTART_DELAY_MS));
-		await this.init();
-		logger.info('Browser restarted');
+			await this.init().catch((err) => logger.error({ err }, 'Browser restart failed'));
+			logger.info('Browser restarted');
+		}, CONFIG.BROWSER_RESTART_DELAY_MS);
+
+		this.restartTimer?.unref?.();
 	}
 
-	// ─── Shutdown ──────────────────────────────────────────────────────────────
+	// ─── Shutdown ─────────────────────────────────────────────────────────────
 
 	async close(): Promise<void> {
 		this.shuttingDown = true;
@@ -417,8 +416,13 @@ class PuppeteerService {
 			clearInterval(this.healthTimer);
 			this.healthTimer = null;
 		}
+		if (this.restartTimer) {
+			clearTimeout(this.restartTimer);
+			this.restartTimer = null;
+		}
 
 		for (const item of this.queue.splice(0)) {
+			clearTimeout(item.timeoutId);
 			item.reject(new Error('Service shutting down'));
 		}
 
@@ -436,11 +440,9 @@ class PuppeteerService {
 
 export const puppeteerService = new PuppeteerService();
 
-process.on('SIGINT', async () => {
+const shutdown = async () => {
 	await puppeteerService.close();
 	process.exit(0);
-});
-process.on('SIGTERM', async () => {
-	await puppeteerService.close();
-	process.exit(0);
-});
+};
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
