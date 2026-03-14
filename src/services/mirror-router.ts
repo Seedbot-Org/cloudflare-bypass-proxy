@@ -24,7 +24,6 @@ export const STAKE_MIRRORS = [
 
 // ─── CF Detection ─────────────────────────────────────────────────────────────
 
-// Expanded signal list — Turnstile, newer CF challenge pages, JS/cookie gates
 const CF_SIGNALS_LOWER = [
 	'just a moment',
 	'checking your browser',
@@ -44,9 +43,7 @@ async function isPageBlockedByCF(page: Page): Promise<boolean> {
 	try {
 		const { title, bodyText, hasCFDom } = await page.evaluate(() => ({
 			title: document.title ?? '',
-			// Grab more text — CF sometimes puts challenge text lower in the DOM
 			bodyText: document.body?.innerText?.slice(0, 3000) ?? '',
-			// Check CF-specific DOM markers that can't be faked by coincidence
 			hasCFDom:
 				!!document.querySelector('meta[name="cf-ray"]') ||
 				!!document.querySelector('[data-cf-turnstile]') ||
@@ -56,11 +53,9 @@ async function isPageBlockedByCF(page: Page): Promise<boolean> {
 		}));
 
 		if (hasCFDom) return true;
-
 		const haystack = `${title} ${bodyText}`.toLowerCase();
 		return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
 	} catch {
-		// If evaluate throws (page crashed / navigating), assume still blocked
 		return true;
 	}
 }
@@ -84,6 +79,38 @@ const MAX_BACKOFF_MS = 30 * 60_000;
 
 function backoffMs(failCount: number): number {
 	return Math.min(BASE_BACKOFF_MS * 2 ** (failCount - 1), MAX_BACKOFF_MS);
+}
+
+// ─── Fast HTTP reachability pre-check ─────────────────────────────────────────
+//
+// Before spending 25s on a Puppeteer navigation, do a cheap Node.js fetch to
+// see if the host responds at all. On Railway (datacenter IP), unreachable hosts
+// fail in <3s via ECONNREFUSED/ENOTFOUND instead of burning the full timeout.
+//
+// Results:
+//   'reachable'   → 2xx/3xx/404 response — host is up, proceed to Puppeteer
+//   'cf-blocked'  → 403/503 response — CF is answering, proceed to Puppeteer
+//   'unreachable' → timeout / DNS fail / ECONNREFUSED — skip immediately
+
+const REACH_TIMEOUT_MS = 5_000;
+
+async function checkReachable(origin: string): Promise<'reachable' | 'unreachable' | 'cf-blocked'> {
+	try {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), REACH_TIMEOUT_MS);
+
+		const res = await fetch(`${origin}/`, {
+			method: 'HEAD',
+			signal: controller.signal,
+			redirect: 'manual',
+		}).finally(() => clearTimeout(timer));
+
+		if (res.status === 403 || res.status === 503) return 'cf-blocked';
+		return 'reachable';
+	} catch (err) {
+		logger.debug({ origin, err: (err as Error).message }, 'Reachability pre-check failed');
+		return 'unreachable';
+	}
 }
 
 // ─── Mirror Router ────────────────────────────────────────────────────────────
@@ -149,15 +176,15 @@ export class MirrorRouter {
 	// ─── CF Bypass ────────────────────────────────────────────────────────────
 
 	/**
-	 * Tries available mirrors in priority order until one passes CF.
-	 * Returns the clean mirror origin.
+	 * Two-phase mirror selection:
 	 *
-	 * Key improvements vs original:
-	 * - Waits for 'networkidle2' not just 'domcontentloaded' — CF challenge JS
-	 *   needs to fully execute and the clearance XHR to complete before we proceed
-	 * - Poll window extended to match CONFIG.CF_SOLVE_TIMEOUT_MS (25s)
-	 * - Faster tick (400ms) for quicker detection after CF auto-solve
-	 * - Logs the solve duration to help tune timeouts
+	 * Phase 1 — parallel cheap reachability checks via Node fetch (5s timeout each).
+	 *   Filters out network-unreachable mirrors instantly without tying up Puppeteer.
+	 *   On Railway/datacenter IPs, this eliminates all unreachable mirrors in ~5s
+	 *   instead of hanging 16 × 25s = 400s.
+	 *
+	 * Phase 2 — sequential Puppeteer navigation only on hosts confirmed reachable.
+	 *   Uses networkidle2 so the CF clearance XHR completes before we proceed.
 	 */
 	async findCleanMirror(page: Page, timeout = 25_000): Promise<string> {
 		const available = this.getAvailableMirrors();
@@ -166,7 +193,45 @@ export class MirrorRouter {
 			throw new Error('All mirrors are on cooldown');
 		}
 
-		for (const origin of available) {
+		// ── Phase 1: parallel reachability pre-check ───────────────────────────
+		logger.debug({ count: available.length }, 'Running parallel reachability pre-check');
+
+		const reachResults = await Promise.all(available.map(async (origin) => ({ origin, reach: await checkReachable(origin) })));
+
+		const reachableMirrors: string[] = [];
+		for (const { origin, reach } of reachResults) {
+			if (reach === 'unreachable') {
+				this.markUnreachable(origin);
+			} else {
+				reachableMirrors.push(origin);
+			}
+		}
+
+		logger.info(
+			{
+				total: available.length,
+				reachable: reachableMirrors.length,
+				unreachable: available.length - reachableMirrors.length,
+			},
+			'Reachability pre-check complete',
+		);
+
+		if (reachableMirrors.length === 0) {
+			// This is almost always a datacenter IP issue, not a CF issue.
+			// Stealth plugins cannot fix IP-level blocks.
+			logger.error(
+				{
+					hint: 'Set RESIDENTIAL_PROXY_URL=http://user:pass@host:port (Webshare, Oxylabs, Bright Data, Smartproxy)',
+				},
+				'All mirrors are network-unreachable — datacenter IP block detected. Residential proxy required.',
+			);
+			throw new Error(
+				'All mirrors are network-unreachable from this server. ' + 'A residential proxy is required — set RESIDENTIAL_PROXY_URL.',
+			);
+		}
+
+		// ── Phase 2: Puppeteer navigation on reachable mirrors only ───────────
+		for (const origin of reachableMirrors) {
 			const result = await this._tryMirror(page, origin, timeout);
 
 			if (result === 'clean') {
@@ -178,66 +243,43 @@ export class MirrorRouter {
 			result === 'blocked' ? this.markBlocked(origin) : this.markUnreachable(origin);
 		}
 
-		throw new Error(`All ${available.length} mirrors are blocked or unreachable`);
+		throw new Error(`All ${reachableMirrors.length} reachable mirrors are CF-blocked`);
 	}
 
 	private async _tryMirror(page: Page, origin: string, timeout: number): Promise<'clean' | 'blocked' | 'unreachable'> {
 		try {
-			logger.debug({ origin }, 'Trying mirror');
+			logger.debug({ origin }, 'Puppeteer navigating to mirror');
 
-			// 'networkidle2' waits for the CF clearance XHR to finish (not just DOM load).
-			// Without this, the page appears ready but cf_clearance cookie isn't set yet.
-			// This is the single most impactful fix in this file.
-			await page.goto(origin, {
-				waitUntil: 'networkidle2',
-				timeout,
-			});
+			// networkidle2 is critical — waits for the CF clearance background XHR.
+			// domcontentloaded returns too early: cf_clearance cookie is not yet set.
+			await page.goto(origin, { waitUntil: 'networkidle2', timeout });
 
-			// After networkidle2, CF may still be running its JS verification loop.
-			// Poll until the challenge disappears or we time out.
 			const solveStart = Date.now();
 			await this._waitForCFClear(page, timeout - (Date.now() - solveStart));
-			const solveDuration = Date.now() - solveStart;
 
 			const blocked = await isPageBlockedByCF(page);
 			if (blocked) {
-				logger.warn({ origin, solveDuration }, 'CF challenge did not resolve within timeout');
+				logger.warn({ origin, elapsed: Date.now() - solveStart }, 'CF challenge did not resolve within timeout');
 				return 'blocked';
 			}
 
-			logger.debug({ origin, solveDuration }, 'CF cleared');
+			logger.debug({ origin, elapsed: Date.now() - solveStart }, 'CF cleared');
 			return 'clean';
 		} catch (err) {
 			const msg = (err as Error).message ?? '';
-
-			// Distinguish navigation timeout (CF is fighting us — mark blocked)
-			// from network errors (mirror is down — mark unreachable)
 			if (msg.includes('timeout') || msg.includes('Timeout')) {
-				logger.warn({ origin, err: msg }, 'Mirror navigation timed out — likely CF hard block');
 				return 'blocked';
 			}
-
-			logger.debug({ origin, err: msg }, 'Mirror nav failed — unreachable');
 			return 'unreachable';
 		}
 	}
 
-	/**
-	 * Polls until CF signals disappear or timeout expires.
-	 *
-	 * Tick reduced from 600ms to 400ms — CF Managed Challenge typically
-	 * auto-solves in 3-8s, so faster polling means we proceed ~200ms earlier
-	 * on average, reducing per-request latency.
-	 */
 	private async _waitForCFClear(page: Page, timeout: number): Promise<void> {
-		const deadline = Date.now() + timeout;
+		const deadline = Date.now() + Math.max(timeout, 0);
 		while (Date.now() < deadline) {
-			const stillBlocked = await isPageBlockedByCF(page);
-			if (!stillBlocked) return;
-			// 400ms tick vs original 600ms
+			if (!(await isPageBlockedByCF(page))) return;
 			await new Promise((r) => setTimeout(r, 400));
 		}
-		// Don't throw — let the caller check and decide whether to mark blocked/unreachable
 	}
 }
 

@@ -20,13 +20,18 @@ export interface ProxyResponse {
 
 const CONFIG = {
 	POOL_SIZE: 3,
-	MAX_REQUESTS_PER_PAGE: 100,
-	PAGE_MAX_AGE_MS: 15 * 60_000,
-	REQUEST_TIMEOUT_MS: 20_000,
-	QUEUE_TIMEOUT_MS: 45_000,
-	// Extended — CF Managed Challenge can take 10-15s to auto-solve
+	MAX_REQUESTS_PER_PAGE: 200,
+	PAGE_MAX_AGE_MS: 20 * 60_000, // 20 min
+
+	// CF clearance TTL is ~5 min. Refresh at 3.5 min to stay safely ahead.
+	// This runs in the background — zero impact on request latency.
+	CF_REFRESH_INTERVAL_MS: 3.5 * 60_000,
+
+	// Timeout for the initial CF solve during warmup / forced refresh
 	CF_SOLVE_TIMEOUT_MS: 25_000,
-	CF_BYPASS_INTERVAL_MS: 4 * 60_000,
+
+	REQUEST_TIMEOUT_MS: 15_000,
+	QUEUE_TIMEOUT_MS: 30_000,
 	HEALTH_CHECK_INTERVAL_MS: 60_000,
 	HEAP_RECYCLE_THRESHOLD_MB: 400,
 	BROWSER_RESTART_DELAY_MS: 1_000,
@@ -37,8 +42,12 @@ interface PooledPage {
 	busy: boolean;
 	requestCount: number;
 	createdAt: number;
-	lastBypassAt: Map<string, number>;
+	// The mirror this page currently holds clearance for (null = not warmed up)
 	activeMirror: string | null;
+	// Whether this page is currently being warmed up (prevents double-warm races)
+	warming: boolean;
+	// Timer that proactively refreshes CF clearance before it expires
+	refreshTimer: NodeJS.Timeout | null;
 }
 
 interface QueuedRequest {
@@ -46,41 +55,6 @@ interface QueuedRequest {
 	resolve: (value: ProxyResponse) => void;
 	reject: (reason: unknown) => void;
 	timeoutId: NodeJS.Timeout;
-}
-
-// CF signals expanded — Turnstile widget and newer challenge pages
-const CF_SIGNALS_LOWER = [
-	'just a moment',
-	'checking your browser',
-	'verifying you are human',
-	'performing security verification',
-	'please wait',
-	'ddos protection by cloudflare',
-	'cf-browser-verification',
-	'cf_chl_opt',
-	'turnstile',
-	'ray id',
-	'enable javascript',
-	'enable cookies',
-] as const;
-
-async function isPageBlockedByCF(page: Page): Promise<boolean> {
-	try {
-		const { title, bodyText, hasCFMeta } = await page.evaluate(() => ({
-			title: document.title,
-			bodyText: document.body?.innerText?.slice(0, 2000) ?? '',
-			// Also check for CF meta tags and script markers injected by Turnstile
-			hasCFMeta:
-				!!document.querySelector('meta[name="cf-ray"]') ||
-				!!document.querySelector('[data-cf-turnstile]') ||
-				!!document.querySelector('script[src*="challenges.cloudflare.com"]'),
-		}));
-		if (hasCFMeta) return true;
-		const haystack = `${title} ${bodyText}`.toLowerCase();
-		return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
-	} catch {
-		return false;
-	}
 }
 
 class PuppeteerService {
@@ -151,11 +125,17 @@ class PuppeteerService {
 			}
 		});
 
+		// Create pages first, then warm them all in parallel.
+		// Requests are queued during warmup — the first request will wait for
+		// warmup to complete, but all subsequent ones hit pre-warmed pages.
 		await Promise.all(Array.from({ length: CONFIG.POOL_SIZE }, () => this._createPage()));
+
+		// Warm all pages concurrently in the background (don't block init return)
+		this._warmAllPages().catch((err) => logger.error({ err }, 'Initial warmup failed'));
 
 		this._startHealthCheck();
 		this.initialized = true;
-		logger.info(`Puppeteer ready (pool: ${CONFIG.POOL_SIZE})`);
+		logger.info(`Puppeteer ready (pool: ${CONFIG.POOL_SIZE}) — warming pages in background`);
 	}
 
 	// ─── Page Management ──────────────────────────────────────────────────────
@@ -165,22 +145,13 @@ class PuppeteerService {
 
 		const page = await this.browser.newPage();
 
-		// Allow 'document' through — needed for CF challenge page to render and auto-solve.
-		// Blocking document causes CF to get stuck since the challenge JS never loads.
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
 			const type = req.resourceType();
-			// Allow: page navigation, scripts (CF challenge JS), XHR/fetch (GraphQL)
-			// Also allow: image/font momentarily if CF challenge needs them (rare but real)
-			if (['document', 'script', 'xhr', 'fetch'].includes(type)) {
+			if (['document', 'script', 'xhr', 'fetch', 'stylesheet'].includes(type)) {
 				req.continue();
 			} else {
-				// Don't abort stylesheets either — CF Turnstile renders based on CSS classes
-				if (type === 'stylesheet') {
-					req.continue();
-				} else {
-					req.abort();
-				}
+				req.abort();
 			}
 		});
 
@@ -191,7 +162,7 @@ class PuppeteerService {
 		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
 		await page.setExtraHTTPHeaders({
 			'Accept-Language': 'en-US,en;q=0.9',
-			Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+			Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
 			'Sec-Fetch-Site': 'none',
 			'Sec-Fetch-Mode': 'navigate',
 			'Sec-Fetch-User': '?1',
@@ -199,12 +170,10 @@ class PuppeteerService {
 			'Upgrade-Insecure-Requests': '1',
 		});
 
-		// Override navigator properties that stealth plugin might miss
 		await page.evaluateOnNewDocument(() => {
 			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 			Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
 			Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-			// Make chrome object look real
 			(window as unknown as Record<string, unknown>).chrome = {
 				runtime: {},
 				loadTimes: () => ({}),
@@ -214,52 +183,131 @@ class PuppeteerService {
 		});
 
 		await page.setDefaultTimeout(CONFIG.REQUEST_TIMEOUT_MS);
-		await page.setDefaultNavigationTimeout(CONFIG.REQUEST_TIMEOUT_MS);
+		await page.setDefaultNavigationTimeout(CONFIG.CF_SOLVE_TIMEOUT_MS);
 
 		const pooled: PooledPage = {
 			page,
 			busy: false,
 			requestCount: 0,
 			createdAt: Date.now(),
-			lastBypassAt: new Map(),
 			activeMirror: null,
+			warming: false,
+			refreshTimer: null,
 		};
 
 		this.pool.push(pooled);
 		return pooled;
 	}
 
+	// ─── CF Warmup ────────────────────────────────────────────────────────────
+	//
+	// KEY CHANGE: CF navigation happens here — once, upfront — not per-request.
+	//
+	// After _warmPage() resolves, the page holds a valid cf_clearance cookie and
+	// is parked on the mirror's origin. Every XHR fired from that page will
+	// automatically carry the clearance. No navigation needed at request time.
+	//
+	// A refresh timer re-runs this every CF_REFRESH_INTERVAL_MS so the clearance
+	// never expires while the service is running.
+
+	private async _warmAllPages(): Promise<void> {
+		await Promise.all(this.pool.map((p) => this._warmPage(p)));
+	}
+
+	private async _warmPage(pooled: PooledPage): Promise<void> {
+		if (pooled.warming) return; // prevent concurrent warm on same page
+		pooled.warming = true;
+
+		// Cancel existing refresh timer before re-warming
+		if (pooled.refreshTimer) {
+			clearTimeout(pooled.refreshTimer);
+			pooled.refreshTimer = null;
+		}
+
+		try {
+			const origin = await mirrorRouter.findCleanMirror(pooled.page, CONFIG.CF_SOLVE_TIMEOUT_MS);
+			pooled.activeMirror = origin;
+			logger.info({ origin }, 'Page warmed — CF clearance acquired');
+
+			// Schedule proactive refresh before clearance expires
+			pooled.refreshTimer = setTimeout(() => {
+				this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Background CF refresh failed — will retry on next request if needed'));
+			}, CONFIG.CF_REFRESH_INTERVAL_MS);
+			pooled.refreshTimer.unref();
+		} catch (err) {
+			logger.error({ err }, 'Page warmup failed');
+			pooled.activeMirror = null;
+		} finally {
+			pooled.warming = false;
+		}
+	}
+
 	private _isHealthy(p: PooledPage): boolean {
-		return Date.now() - p.createdAt <= CONFIG.PAGE_MAX_AGE_MS && p.requestCount < CONFIG.MAX_REQUESTS_PER_PAGE;
+		return (
+			Date.now() - p.createdAt <= CONFIG.PAGE_MAX_AGE_MS && p.requestCount < CONFIG.MAX_REQUESTS_PER_PAGE && p.activeMirror !== null // not warmed = not healthy for requests
+		);
 	}
 
 	private async _recyclePage(pooled: PooledPage): Promise<void> {
 		const idx = this.pool.indexOf(pooled);
 		if (idx === -1) return;
 		logger.debug(`Recycling page (requests: ${pooled.requestCount})`);
+
+		if (pooled.refreshTimer) {
+			clearTimeout(pooled.refreshTimer);
+			pooled.refreshTimer = null;
+		}
+
 		this.pool.splice(idx, 1);
 		await pooled.page.close().catch(() => {});
-		await this._createPage();
+
+		const fresh = await this._createPage();
+		// Warm the new page in background — don't hold up the recycle
+		this._warmPage(fresh).catch((err) => logger.warn({ err }, 'Recycled page warmup failed'));
 	}
 
 	private async _acquirePage(): Promise<PooledPage> {
 		await this.init();
 
-		const free = this.pool.find((p) => !p.busy && this._isHealthy(p));
-		if (free) {
-			free.busy = true;
-			return free;
+		// Prefer a warm, healthy, free page
+		const ready = this.pool.find((p) => !p.busy && !p.warming && this._isHealthy(p));
+		if (ready) {
+			ready.busy = true;
+			return ready;
 		}
 
+		// If a page is warming, wait for it rather than navigating again
+		const warming = this.pool.find((p) => !p.busy && p.warming);
+		if (warming) {
+			logger.debug('Waiting for page warmup to complete...');
+			await this._waitForWarm(warming);
+			if (warming.activeMirror) {
+				warming.busy = true;
+				return warming;
+			}
+		}
+
+		// Stale but free — recycle + warm, then use it
 		const stale = this.pool.find((p) => !p.busy);
 		if (stale) {
 			await this._recyclePage(stale);
 			const fresh = this.pool[this.pool.length - 1];
+			// Wait for fresh page warmup
+			if (!fresh.activeMirror) {
+				await this._waitForWarm(fresh);
+			}
 			fresh.busy = true;
 			return fresh;
 		}
 
 		throw new Error('POOL_EXHAUSTED');
+	}
+
+	private async _waitForWarm(pooled: PooledPage, maxWait = CONFIG.CF_SOLVE_TIMEOUT_MS): Promise<void> {
+		const deadline = Date.now() + maxWait;
+		while (Date.now() < deadline && pooled.warming) {
+			await new Promise((r) => setTimeout(r, 200));
+		}
 	}
 
 	private _releasePage(pooled: PooledPage): void {
@@ -283,7 +331,7 @@ class PuppeteerService {
 
 	private _drainQueue(): void {
 		while (this.queue.length > 0) {
-			const free = this.pool.find((p) => !p.busy && this._isHealthy(p));
+			const free = this.pool.find((p) => !p.busy && !p.warming && this._isHealthy(p));
 			if (!free) break;
 
 			const item = this.queue.shift()!;
@@ -297,48 +345,20 @@ class PuppeteerService {
 		}
 	}
 
-	// ─── Cloudflare Bypass ────────────────────────────────────────────────────
-
-	/**
-	 * Proper CF bypass strategy:
-	 * 1. Navigate to the origin root (not the GraphQL endpoint directly)
-	 * 2. Poll until CF challenge auto-solves (Managed Challenge can take 10-15s)
-	 * 3. Verify the page is clean before proceeding
-	 * 4. The page's cookie jar now holds valid cf_clearance cookies
-	 *    which will automatically be sent with all subsequent XHR requests
-	 */
-	private async _bypassCloudflare(pooled: PooledPage, request: GraphQLRequest): Promise<void> {
-		const origin = new URL(request.url).origin;
-		const lastBypass = pooled.lastBypassAt.get(origin) ?? 0;
-
-		if (pooled.activeMirror === origin && Date.now() - lastBypass <= CONFIG.CF_BYPASS_INTERVAL_MS) {
-			return; // Still fresh
-		}
-
-		logger.debug({ origin }, 'Acquiring CF clearance');
-
-		// Use mirrorRouter to find a clean mirror — updates request.url if rotated
-		const cleanOrigin = await mirrorRouter.findCleanMirror(pooled.page, CONFIG.CF_SOLVE_TIMEOUT_MS);
-
-		pooled.activeMirror = cleanOrigin;
-		pooled.lastBypassAt.set(cleanOrigin, Date.now());
-
-		if (cleanOrigin !== origin) {
-			// Rewrite the request URL to the working mirror
-			request.url = request.url.replace(origin, cleanOrigin);
-			logger.info({ from: origin, to: cleanOrigin }, 'Mirror rotated');
-		}
-
-		// Brief pause after navigation to let CF cookies settle into the jar
-		// before the XHR fires. 1.2s is safer than 800ms for slow CF challenges.
-		await new Promise((r) => setTimeout(r, 1_200));
-	}
-
 	// ─── GraphQL Fetch ────────────────────────────────────────────────────────
 
 	private async _executeRequest(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
 		const start = Date.now();
-		await this._bypassCloudflare(pooled, request);
+
+		// Rewrite the URL to the mirror this page has clearance for.
+		// No navigation — the page is already parked on the mirror.
+		if (pooled.activeMirror) {
+			const originalOrigin = new URL(request.url).origin;
+			if (originalOrigin !== pooled.activeMirror) {
+				request.url = request.url.replace(originalOrigin, pooled.activeMirror);
+			}
+		}
+
 		pooled.requestCount++;
 
 		try {
@@ -358,22 +378,8 @@ class PuppeteerService {
 		}
 	}
 
-	/**
-	 * Two-strategy fetch with automatic CF-block recovery.
-	 *
-	 * Strategy A (primary): page.evaluate XHR
-	 *   — Runs inside the page context so cf_clearance cookies are sent automatically.
-	 *   — Works when the page has a valid CF clearance already.
-	 *
-	 * Strategy B (fallback): waitForResponse interception
-	 *   — Triggers the XHR from within the page, intercepts the response at the CDP level.
-	 *   — Used when Strategy A returns 403 (clearance expired mid-session).
-	 *   — Forces re-navigation to refresh clearance, then retries once.
-	 */
 	private async _cdpFetch(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
-		if (pooled.page.isClosed()) {
-			throw new Error('Page is closed');
-		}
+		if (pooled.page.isClosed()) throw new Error('Page is closed');
 
 		const headers: Record<string, string> = {
 			'Content-Type': 'application/json',
@@ -387,17 +393,20 @@ class PuppeteerService {
 			...(request.operationName && { operationName: request.operationName }),
 		});
 
-		// Primary strategy — XHR inside page context inherits CF cookies from the jar
 		const result = await pooled.page.evaluate(
 			({ url, headers, body }) =>
 				new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
 					const xhr = new XMLHttpRequest();
 					xhr.open('POST', url, true);
 					for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
-					xhr.timeout = 15_000;
+					xhr.timeout = 12_000;
 					xhr.onload = () => {
 						try {
-							resolve({ success: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: JSON.parse(xhr.responseText) });
+							resolve({
+								success: xhr.status >= 200 && xhr.status < 300,
+								status: xhr.status,
+								data: JSON.parse(xhr.responseText),
+							});
 						} catch {
 							resolve({ success: false, status: xhr.status, error: `Failed to parse JSON (status ${xhr.status})` });
 						}
@@ -409,44 +418,16 @@ class PuppeteerService {
 			{ url: request.url, headers, body },
 		);
 
-		// On CF block, invalidate current mirror clearance and rotate
+		// CF blocked mid-session — clearance expired sooner than expected.
+		// Trigger a background re-warm and return error so the caller can retry.
 		if (result.status === 403 || result.status === 503) {
 			const origin = new URL(request.url).origin;
-			logger.warn({ status: result.status, origin }, 'CF block on XHR — invalidating clearance and rotating mirror');
-
-			// Invalidate so _bypassCloudflare forces a fresh navigation on next call
-			pooled.lastBypassAt.delete(origin);
-			pooled.activeMirror = null;
+			logger.warn({ status: result.status, origin }, 'CF block — triggering background re-warm');
 			mirrorRouter.markBlocked(origin);
-
-			// Retry once with forced re-bypass instead of returning the 403 to caller.
-			// This handles the case where CF clearance expires mid-session.
-			logger.info('Retrying with fresh CF clearance...');
-			await this._bypassCloudflare(pooled, request);
-
-			return pooled.page.evaluate(
-				({ url, headers, body }) =>
-					new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
-						const xhr = new XMLHttpRequest();
-						xhr.open('POST', url, true);
-						for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
-						xhr.timeout = 15_000;
-						xhr.onload = () => {
-							try {
-								resolve({ success: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: JSON.parse(xhr.responseText) });
-							} catch {
-								resolve({ success: false, status: xhr.status, error: `Failed to parse JSON on retry (status ${xhr.status})` });
-							}
-						};
-						xhr.onerror = () => resolve({ success: false, error: 'XHR network error on retry' });
-						xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out on retry' });
-						xhr.send(body);
-					}),
-				{ url: request.url, headers, body },
-			);
-		}
-
-		if (result.success) {
+			pooled.activeMirror = null;
+			// Re-warm in background; don't block the response
+			this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Re-warm after CF block failed'));
+		} else if (result.success) {
 			mirrorRouter.markHealthy(new URL(request.url).origin);
 		}
 
@@ -488,6 +469,8 @@ class PuppeteerService {
 		return {
 			poolSize: this.pool.length,
 			busyPages: this.pool.filter((p) => p.busy).length,
+			warmPages: this.pool.filter((p) => p.activeMirror !== null).length,
+			warmingPages: this.pool.filter((p) => p.warming).length,
 			queueLength: this.queue.length,
 			initialized: this.initialized,
 			heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
@@ -499,13 +482,13 @@ class PuppeteerService {
 
 	private _startHealthCheck(): void {
 		this.healthTimer = setInterval(async () => {
-			const { heapMB, busyPages, queueLength } = this.getStats();
-			logger.debug({ heapMB, busyPages, queueLength }, 'Health');
+			const stats = this.getStats();
+			logger.debug(stats, 'Health');
 
-			if (heapMB > CONFIG.HEAP_RECYCLE_THRESHOLD_MB) {
+			if (stats.heapMB > CONFIG.HEAP_RECYCLE_THRESHOLD_MB) {
 				const oldest = this.pool.filter((p) => !p.busy).sort((a, b) => a.createdAt - b.createdAt)[0];
 				if (oldest) {
-					logger.warn({ heapMB }, 'High memory — recycling oldest page');
+					logger.warn({ heapMB: stats.heapMB }, 'High memory — recycling oldest page');
 					await this._recyclePage(oldest);
 				}
 			}
@@ -528,7 +511,12 @@ class PuppeteerService {
 				item.reject(new Error('Browser crashed'));
 			}
 
+			// Clear refresh timers before nuking pool
+			for (const p of this.pool) {
+				if (p.refreshTimer) clearTimeout(p.refreshTimer);
+			}
 			this.pool = [];
+
 			await this.browser?.close().catch(() => {});
 			this.browser = null;
 
@@ -556,6 +544,10 @@ class PuppeteerService {
 		for (const item of this.queue.splice(0)) {
 			clearTimeout(item.timeoutId);
 			item.reject(new Error('Service shutting down'));
+		}
+
+		for (const p of this.pool) {
+			if (p.refreshTimer) clearTimeout(p.refreshTimer);
 		}
 
 		await Promise.allSettled(this.pool.map((p) => p.page.close()));
