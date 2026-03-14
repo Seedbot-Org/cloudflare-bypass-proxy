@@ -122,7 +122,7 @@ class PuppeteerService {
 		}
 
 		this.browser = await puppeteerExtra.default.launch({
-			headless: false,
+			headless: true,
 			executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 			args: [
 				'--no-sandbox',
