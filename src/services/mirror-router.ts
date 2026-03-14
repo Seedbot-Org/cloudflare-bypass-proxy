@@ -24,8 +24,8 @@ export const STAKE_MIRRORS = [
 
 // ─── CF Detection ─────────────────────────────────────────────────────────────
 
-// Ordered by how commonly they appear — short-circuits faster
-const CF_SIGNALS = [
+// Expanded signal list — Turnstile, newer CF challenge pages, JS/cookie gates
+const CF_SIGNALS_LOWER = [
 	'just a moment',
 	'checking your browser',
 	'verifying you are human',
@@ -34,26 +34,34 @@ const CF_SIGNALS = [
 	'ddos protection by cloudflare',
 	'cf-browser-verification',
 	'cf_chl_opt',
+	'turnstile',
+	'enable javascript',
+	'enable cookies',
+	'ray id',
 ] as const;
-
-// Pre-built lowercase array — avoids re-allocating on every check
-const CF_SIGNALS_LOWER = CF_SIGNALS.map((s) => s.toLowerCase());
-
-function isCloudflareChallenge(title: string, bodyText: string): boolean {
-	const haystack = `${title} ${bodyText}`.toLowerCase();
-	return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
-}
 
 async function isPageBlockedByCF(page: Page): Promise<boolean> {
 	try {
-		const { title, bodyText } = await page.evaluate(() => ({
-			title: document.title,
-			// Only grab first 1000 chars — CF signals are always near the top
-			bodyText: document.body?.innerText?.slice(0, 1000) ?? '',
+		const { title, bodyText, hasCFDom } = await page.evaluate(() => ({
+			title: document.title ?? '',
+			// Grab more text — CF sometimes puts challenge text lower in the DOM
+			bodyText: document.body?.innerText?.slice(0, 3000) ?? '',
+			// Check CF-specific DOM markers that can't be faked by coincidence
+			hasCFDom:
+				!!document.querySelector('meta[name="cf-ray"]') ||
+				!!document.querySelector('[data-cf-turnstile]') ||
+				!!document.querySelector('script[src*="challenges.cloudflare.com"]') ||
+				!!document.getElementById('cf-wrapper') ||
+				!!document.getElementById('challenge-form'),
 		}));
-		return isCloudflareChallenge(title, bodyText);
+
+		if (hasCFDom) return true;
+
+		const haystack = `${title} ${bodyText}`.toLowerCase();
+		return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
 	} catch {
-		return false;
+		// If evaluate throws (page crashed / navigating), assume still blocked
+		return true;
 	}
 }
 
@@ -71,8 +79,8 @@ export interface MirrorState {
 
 // ─── Backoff ──────────────────────────────────────────────────────────────────
 
-const BASE_BACKOFF_MS = 2 * 60_000; // 2 min
-const MAX_BACKOFF_MS = 30 * 60_000; // 30 min cap
+const BASE_BACKOFF_MS = 2 * 60_000;
+const MAX_BACKOFF_MS = 30 * 60_000;
 
 function backoffMs(failCount: number): number {
 	return Math.min(BASE_BACKOFF_MS * 2 ** (failCount - 1), MAX_BACKOFF_MS);
@@ -91,7 +99,6 @@ export class MirrorRouter {
 
 	getAvailableMirrors(): string[] {
 		const now = Date.now();
-		// Rank: healthy=0, unknown=1, everything else=2
 		const rank = (s: MirrorStatus) => (s === 'healthy' ? 0 : s === 'unknown' ? 1 : 2);
 
 		return [...this.mirrors.values()]
@@ -142,10 +149,17 @@ export class MirrorRouter {
 	// ─── CF Bypass ────────────────────────────────────────────────────────────
 
 	/**
-	 * Tries available mirrors in priority order until one is CF-clean.
-	 * Returns the origin of the first working mirror.
+	 * Tries available mirrors in priority order until one passes CF.
+	 * Returns the clean mirror origin.
+	 *
+	 * Key improvements vs original:
+	 * - Waits for 'networkidle2' not just 'domcontentloaded' — CF challenge JS
+	 *   needs to fully execute and the clearance XHR to complete before we proceed
+	 * - Poll window extended to match CONFIG.CF_SOLVE_TIMEOUT_MS (25s)
+	 * - Faster tick (400ms) for quicker detection after CF auto-solve
+	 * - Logs the solve duration to help tune timeouts
 	 */
-	async findCleanMirror(page: Page, timeout = 30_000): Promise<string> {
+	async findCleanMirror(page: Page, timeout = 25_000): Promise<string> {
 		const available = this.getAvailableMirrors();
 
 		if (available.length === 0) {
@@ -157,7 +171,7 @@ export class MirrorRouter {
 
 			if (result === 'clean') {
 				this.markHealthy(origin);
-				logger.info({ origin }, 'Clean mirror found');
+				logger.info({ origin }, 'Clean mirror — CF clearance acquired');
 				return origin;
 			}
 
@@ -169,25 +183,61 @@ export class MirrorRouter {
 
 	private async _tryMirror(page: Page, origin: string, timeout: number): Promise<'clean' | 'blocked' | 'unreachable'> {
 		try {
-			await page.goto(origin, { waitUntil: 'domcontentloaded', timeout });
-			await this._waitForCFClear(page, 8_000);
-			return (await isPageBlockedByCF(page)) ? 'blocked' : 'clean';
+			logger.debug({ origin }, 'Trying mirror');
+
+			// 'networkidle2' waits for the CF clearance XHR to finish (not just DOM load).
+			// Without this, the page appears ready but cf_clearance cookie isn't set yet.
+			// This is the single most impactful fix in this file.
+			await page.goto(origin, {
+				waitUntil: 'networkidle2',
+				timeout,
+			});
+
+			// After networkidle2, CF may still be running its JS verification loop.
+			// Poll until the challenge disappears or we time out.
+			const solveStart = Date.now();
+			await this._waitForCFClear(page, timeout - (Date.now() - solveStart));
+			const solveDuration = Date.now() - solveStart;
+
+			const blocked = await isPageBlockedByCF(page);
+			if (blocked) {
+				logger.warn({ origin, solveDuration }, 'CF challenge did not resolve within timeout');
+				return 'blocked';
+			}
+
+			logger.debug({ origin, solveDuration }, 'CF cleared');
+			return 'clean';
 		} catch (err) {
-			logger.debug({ origin, err: (err as Error).message }, 'Mirror nav failed');
+			const msg = (err as Error).message ?? '';
+
+			// Distinguish navigation timeout (CF is fighting us — mark blocked)
+			// from network errors (mirror is down — mark unreachable)
+			if (msg.includes('timeout') || msg.includes('Timeout')) {
+				logger.warn({ origin, err: msg }, 'Mirror navigation timed out — likely CF hard block');
+				return 'blocked';
+			}
+
+			logger.debug({ origin, err: msg }, 'Mirror nav failed — unreachable');
 			return 'unreachable';
 		}
 	}
 
 	/**
 	 * Polls until CF signals disappear or timeout expires.
-	 * Avoids waitForFunction to skip serialising the signals array on every tick.
+	 *
+	 * Tick reduced from 600ms to 400ms — CF Managed Challenge typically
+	 * auto-solves in 3-8s, so faster polling means we proceed ~200ms earlier
+	 * on average, reducing per-request latency.
 	 */
 	private async _waitForCFClear(page: Page, timeout: number): Promise<void> {
 		const deadline = Date.now() + timeout;
 		while (Date.now() < deadline) {
-			if (!(await isPageBlockedByCF(page))) return;
-			await new Promise((r) => setTimeout(r, 600));
+			const stillBlocked = await isPageBlockedByCF(page);
+			if (!stillBlocked) return;
+			// 400ms tick vs original 600ms
+			await new Promise((r) => setTimeout(r, 400));
 		}
+		// Don't throw — let the caller check and decide whether to mark blocked/unreachable
 	}
 }
 
