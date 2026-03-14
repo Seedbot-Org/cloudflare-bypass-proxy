@@ -286,9 +286,11 @@ export class MirrorRouter {
 
 	private async _waitForCFClear(page: Page, timeout: number): Promise<void> {
 		const deadline = Date.now() + Math.max(timeout, 0);
+		let interval = 500;
 		while (Date.now() < deadline) {
 			if (!(await isPageBlockedByCF(page))) return;
-			await new Promise((r) => setTimeout(r, 400));
+			await new Promise((r) => setTimeout(r, interval));
+			interval = Math.min(interval * 1.5, 3_000);
 		}
 	}
 }
