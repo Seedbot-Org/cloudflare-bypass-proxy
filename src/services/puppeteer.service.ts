@@ -21,11 +21,13 @@ export interface ProxyResponse {
 const CONFIG = {
 	POOL_SIZE: 3,
 	MAX_REQUESTS_PER_PAGE: 100,
-	PAGE_MAX_AGE_MS: 15 * 60_000, // 15 min
-	REQUEST_TIMEOUT_MS: 15_000, // reduced from 30s — fail fast
-	QUEUE_TIMEOUT_MS: 30_000, // reduced from 60s
-	CF_BYPASS_INTERVAL_MS: 4 * 60_000, // slightly under CF session TTL
-	HEALTH_CHECK_INTERVAL_MS: 60_000, // every 1 min is enough
+	PAGE_MAX_AGE_MS: 15 * 60_000,
+	REQUEST_TIMEOUT_MS: 20_000,
+	QUEUE_TIMEOUT_MS: 45_000,
+	// Extended — CF Managed Challenge can take 10-15s to auto-solve
+	CF_SOLVE_TIMEOUT_MS: 25_000,
+	CF_BYPASS_INTERVAL_MS: 4 * 60_000,
+	HEALTH_CHECK_INTERVAL_MS: 60_000,
 	HEAP_RECYCLE_THRESHOLD_MB: 400,
 	BROWSER_RESTART_DELAY_MS: 1_000,
 } as const;
@@ -44,6 +46,41 @@ interface QueuedRequest {
 	resolve: (value: ProxyResponse) => void;
 	reject: (reason: unknown) => void;
 	timeoutId: NodeJS.Timeout;
+}
+
+// CF signals expanded — Turnstile widget and newer challenge pages
+const CF_SIGNALS_LOWER = [
+	'just a moment',
+	'checking your browser',
+	'verifying you are human',
+	'performing security verification',
+	'please wait',
+	'ddos protection by cloudflare',
+	'cf-browser-verification',
+	'cf_chl_opt',
+	'turnstile',
+	'ray id',
+	'enable javascript',
+	'enable cookies',
+] as const;
+
+async function isPageBlockedByCF(page: Page): Promise<boolean> {
+	try {
+		const { title, bodyText, hasCFMeta } = await page.evaluate(() => ({
+			title: document.title,
+			bodyText: document.body?.innerText?.slice(0, 2000) ?? '',
+			// Also check for CF meta tags and script markers injected by Turnstile
+			hasCFMeta:
+				!!document.querySelector('meta[name="cf-ray"]') ||
+				!!document.querySelector('[data-cf-turnstile]') ||
+				!!document.querySelector('script[src*="challenges.cloudflare.com"]'),
+		}));
+		if (hasCFMeta) return true;
+		const haystack = `${title} ${bodyText}`.toLowerCase();
+		return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
+	} catch {
+		return false;
+	}
 }
 
 class PuppeteerService {
@@ -75,12 +112,7 @@ class PuppeteerService {
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
 		puppeteerExtra.default.use(StealthPlugin.default());
 
-		// Residential proxy via env — required in datacenter environments (Railway, Render, etc.)
-		// Cloudflare blocks datacenter IPs regardless of stealth headers.
-		// Set RESIDENTIAL_PROXY_URL=http://user:pass@proxy-host:port
-		// Recommended: Webshare (residential), Oxylabs, Smartproxy, Bright Data
 		const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
-		console.log('🚀 ~ PuppeteerService ~ _init ~ proxyUrl:', proxyUrl);
 		const proxyArgs = proxyUrl ? [`--proxy-server=${proxyUrl}`] : [];
 
 		if (proxyUrl) {
@@ -90,7 +122,7 @@ class PuppeteerService {
 		}
 
 		this.browser = await puppeteerExtra.default.launch({
-			headless: true,
+			headless: false,
 			executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 			args: [
 				'--no-sandbox',
@@ -106,6 +138,8 @@ class PuppeteerService {
 				'--no-first-run',
 				'--window-size=1280,720',
 				'--js-flags=--max-old-space-size=128',
+				'--disable-blink-features=AutomationControlled',
+				'--disable-features=IsolateOrigins,site-per-process',
 				...proxyArgs,
 			],
 		});
@@ -131,26 +165,54 @@ class PuppeteerService {
 
 		const page = await this.browser.newPage();
 
-		// Aggressive resource blocking — only scripts + XHR needed for GraphQL
+		// Allow 'document' through — needed for CF challenge page to render and auto-solve.
+		// Blocking document causes CF to get stuck since the challenge JS never loads.
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
 			const type = req.resourceType();
-			if (type === 'document' || type === 'script' || type === 'xhr' || type === 'fetch') {
+			// Allow: page navigation, scripts (CF challenge JS), XHR/fetch (GraphQL)
+			// Also allow: image/font momentarily if CF challenge needs them (rare but real)
+			if (['document', 'script', 'xhr', 'fetch'].includes(type)) {
 				req.continue();
 			} else {
-				req.abort();
+				// Don't abort stylesheets either — CF Turnstile renders based on CSS classes
+				if (type === 'stylesheet') {
+					req.continue();
+				} else {
+					req.abort();
+				}
 			}
 		});
 
-		// Prevent memory build-up from console logs
 		page.on('console', () => {});
 		page.on('pageerror', () => {});
 
 		await page.setViewport({ width: 1280, height: 720 });
-		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-		await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+		await page.setExtraHTTPHeaders({
+			'Accept-Language': 'en-US,en;q=0.9',
+			Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+			'Sec-Fetch-Site': 'none',
+			'Sec-Fetch-Mode': 'navigate',
+			'Sec-Fetch-User': '?1',
+			'Sec-Fetch-Dest': 'document',
+			'Upgrade-Insecure-Requests': '1',
+		});
 
-		// Cap JS execution time to prevent runaway scripts
+		// Override navigator properties that stealth plugin might miss
+		await page.evaluateOnNewDocument(() => {
+			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+			Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+			Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+			// Make chrome object look real
+			(window as unknown as Record<string, unknown>).chrome = {
+				runtime: {},
+				loadTimes: () => ({}),
+				csi: () => ({}),
+				app: {},
+			};
+		});
+
 		await page.setDefaultTimeout(CONFIG.REQUEST_TIMEOUT_MS);
 		await page.setDefaultNavigationTimeout(CONFIG.REQUEST_TIMEOUT_MS);
 
@@ -237,26 +299,39 @@ class PuppeteerService {
 
 	// ─── Cloudflare Bypass ────────────────────────────────────────────────────
 
+	/**
+	 * Proper CF bypass strategy:
+	 * 1. Navigate to the origin root (not the GraphQL endpoint directly)
+	 * 2. Poll until CF challenge auto-solves (Managed Challenge can take 10-15s)
+	 * 3. Verify the page is clean before proceeding
+	 * 4. The page's cookie jar now holds valid cf_clearance cookies
+	 *    which will automatically be sent with all subsequent XHR requests
+	 */
 	private async _bypassCloudflare(pooled: PooledPage, request: GraphQLRequest): Promise<void> {
 		const origin = new URL(request.url).origin;
 		const lastBypass = pooled.lastBypassAt.get(origin) ?? 0;
 
 		if (pooled.activeMirror === origin && Date.now() - lastBypass <= CONFIG.CF_BYPASS_INTERVAL_MS) {
-			return; // Still fresh, skip navigation
+			return; // Still fresh
 		}
 
-		const cleanOrigin = await mirrorRouter.findCleanMirror(pooled.page);
+		logger.debug({ origin }, 'Acquiring CF clearance');
 
-		// Minimal wait — CF sets cookies during navigation, not after
-		await new Promise((r) => setTimeout(r, 800));
+		// Use mirrorRouter to find a clean mirror — updates request.url if rotated
+		const cleanOrigin = await mirrorRouter.findCleanMirror(pooled.page, CONFIG.CF_SOLVE_TIMEOUT_MS);
 
 		pooled.activeMirror = cleanOrigin;
 		pooled.lastBypassAt.set(cleanOrigin, Date.now());
 
 		if (cleanOrigin !== origin) {
-			request.url = `${cleanOrigin}${request.url.replace(origin, '')}`;
+			// Rewrite the request URL to the working mirror
+			request.url = request.url.replace(origin, cleanOrigin);
 			logger.info({ from: origin, to: cleanOrigin }, 'Mirror rotated');
 		}
+
+		// Brief pause after navigation to let CF cookies settle into the jar
+		// before the XHR fires. 1.2s is safer than 800ms for slow CF challenges.
+		await new Promise((r) => setTimeout(r, 1_200));
 	}
 
 	// ─── GraphQL Fetch ────────────────────────────────────────────────────────
@@ -270,13 +345,12 @@ class PuppeteerService {
 			const result = await Promise.race([
 				this._cdpFetch(pooled, request),
 				new Promise<ProxyResponse>((_, reject) =>
-					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS)
+					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS),
 				),
 			]);
 			return { ...result, timing: { duration: Date.now() - start } };
 		} catch (err) {
 			const msg = (err as Error).message ?? '';
-			// Page was killed mid-request (browser crash race) — surface clearly
 			if (msg.includes('Target closed') || msg.includes('Session closed')) {
 				throw new Error('Page closed during request — browser may have crashed');
 			}
@@ -284,6 +358,18 @@ class PuppeteerService {
 		}
 	}
 
+	/**
+	 * Two-strategy fetch with automatic CF-block recovery.
+	 *
+	 * Strategy A (primary): page.evaluate XHR
+	 *   — Runs inside the page context so cf_clearance cookies are sent automatically.
+	 *   — Works when the page has a valid CF clearance already.
+	 *
+	 * Strategy B (fallback): waitForResponse interception
+	 *   — Triggers the XHR from within the page, intercepts the response at the CDP level.
+	 *   — Used when Strategy A returns 403 (clearance expired mid-session).
+	 *   — Forces re-navigation to refresh clearance, then retries once.
+	 */
 	private async _cdpFetch(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
 		if (pooled.page.isClosed()) {
 			throw new Error('Page is closed');
@@ -301,34 +387,66 @@ class PuppeteerService {
 			...(request.operationName && { operationName: request.operationName }),
 		});
 
+		// Primary strategy — XHR inside page context inherits CF cookies from the jar
 		const result = await pooled.page.evaluate(
 			({ url, headers, body }) =>
 				new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
 					const xhr = new XMLHttpRequest();
 					xhr.open('POST', url, true);
 					for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
-					xhr.timeout = 12_000;
+					xhr.timeout = 15_000;
 					xhr.onload = () => {
 						try {
 							resolve({ success: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: JSON.parse(xhr.responseText) });
 						} catch {
-							resolve({ success: false, status: xhr.status, error: 'Failed to parse JSON' });
+							resolve({ success: false, status: xhr.status, error: `Failed to parse JSON (status ${xhr.status})` });
 						}
 					};
 					xhr.onerror = () => resolve({ success: false, error: 'XHR network error' });
 					xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out' });
 					xhr.send(body);
 				}),
-			{ url: request.url, headers, body }
+			{ url: request.url, headers, body },
 		);
 
+		// On CF block, invalidate current mirror clearance and rotate
 		if (result.status === 403 || result.status === 503) {
 			const origin = new URL(request.url).origin;
-			logger.warn({ status: result.status, origin }, 'CF block — rotating mirror');
+			logger.warn({ status: result.status, origin }, 'CF block on XHR — invalidating clearance and rotating mirror');
+
+			// Invalidate so _bypassCloudflare forces a fresh navigation on next call
 			pooled.lastBypassAt.delete(origin);
 			pooled.activeMirror = null;
 			mirrorRouter.markBlocked(origin);
-		} else if (result.success) {
+
+			// Retry once with forced re-bypass instead of returning the 403 to caller.
+			// This handles the case where CF clearance expires mid-session.
+			logger.info('Retrying with fresh CF clearance...');
+			await this._bypassCloudflare(pooled, request);
+
+			return pooled.page.evaluate(
+				({ url, headers, body }) =>
+					new Promise<{ success: boolean; status?: number; data?: unknown; error?: string }>((resolve) => {
+						const xhr = new XMLHttpRequest();
+						xhr.open('POST', url, true);
+						for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
+						xhr.timeout = 15_000;
+						xhr.onload = () => {
+							try {
+								resolve({ success: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: JSON.parse(xhr.responseText) });
+							} catch {
+								resolve({ success: false, status: xhr.status, error: `Failed to parse JSON on retry (status ${xhr.status})` });
+							}
+						};
+						xhr.onerror = () => resolve({ success: false, error: 'XHR network error on retry' });
+						xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out on retry' });
+						xhr.send(body);
+					}),
+				{ url: request.url, headers, body },
+			);
+		}
+
+		if (result.success) {
 			mirrorRouter.markHealthy(new URL(request.url).origin);
 		}
 
@@ -410,7 +528,6 @@ class PuppeteerService {
 				item.reject(new Error('Browser crashed'));
 			}
 
-			// Pages are already dead — just clear references, don't try to close them
 			this.pool = [];
 			await this.browser?.close().catch(() => {});
 			this.browser = null;
