@@ -36,23 +36,6 @@ const CONFIG = {
 	BROWSER_RESTART_DELAY_MS: 1_000,
 } as const;
 
-// ─── Proxy config ─────────────────────────────────────────────────────────────
-interface ProxyConfig {
-	server: string; // host:port  — passed to --proxy-server
-	username: string;
-	password: string;
-}
-
-function parseProxyUrl(raw: string): ProxyConfig {
-	try {
-		const url = new URL(raw);
-		const server = `${url.hostname}:${url.port}`;
-		return { server, username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) };
-	} catch {
-		throw new Error(`Invalid RESIDENTIAL_PROXY_URL: "${raw}". Expected format: http://user:pass@host:port`);
-	}
-}
-
 interface PooledPage {
 	page: Page;
 	busy: boolean;
@@ -82,7 +65,6 @@ class PuppeteerService {
 	private shuttingDown = false;
 	private healthTimer: NodeJS.Timeout | null = null;
 	private restartTimer: NodeJS.Timeout | null = null;
-	private proxyConfig: ProxyConfig | null = null;
 
 	// ─── Init ─────────────────────────────────────────────────────────────────
 
@@ -97,28 +79,19 @@ class PuppeteerService {
 	}
 
 	private async _init(): Promise<void> {
-		logger.info('Launching Puppeteer...');
+		logger.info('Starting up...');
 
+		// Probe all mirrors in parallel via cheap HTTP (no browser needed).
+		// This runs BEFORE launching Puppeteer so by the time pages are created,
+		// mirrorRouter already knows which mirrors are reachable and their latency rank.
+		// Each subsequent _warmPage() navigates directly to the top mirror — no probing.
+		await mirrorRouter.discoverMirrors();
+
+		// Launch browser
+		logger.info('Launching Puppeteer...');
 		const puppeteerExtra = await import('puppeteer-extra');
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
 		puppeteerExtra.default.use(StealthPlugin.default());
-
-		// Parse proxy — fail loudly at startup rather than silently failing later
-		const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
-		if (proxyUrl) {
-			this.proxyConfig = parseProxyUrl(proxyUrl);
-			logger.info({ server: this.proxyConfig.server, username: this.proxyConfig.username }, 'Residential proxy configured');
-		} else {
-			logger.warn(
-				'No RESIDENTIAL_PROXY_URL set. ' +
-					'Railway/Render/Fly datacenter IPs are blocked by Cloudflare. ' +
-					'Set RESIDENTIAL_PROXY_URL=http://user:pass@host:port',
-			);
-		}
-
-		const proxyArgs = this.proxyConfig
-			? [`--proxy-server=${this.proxyConfig.server}`] // host:port only — NO credentials here
-			: [];
 
 		this.browser = await puppeteerExtra.default.launch({
 			headless: true,
@@ -139,7 +112,6 @@ class PuppeteerService {
 				'--js-flags=--max-old-space-size=128',
 				'--disable-blink-features=AutomationControlled',
 				'--disable-features=IsolateOrigins,site-per-process',
-				...proxyArgs,
 			],
 		});
 
@@ -150,9 +122,9 @@ class PuppeteerService {
 			}
 		});
 
-		// Create pages first, then warm them all in parallel.
-		// Requests are queued during warmup — the first request will wait for
-		// warmup to complete, but all subsequent ones hit pre-warmed pages.
+		// Create pages and warm them all in parallel.
+		// Because discoverMirrors() already ranked mirrors, each _warmPage()
+		// goes straight to the best mirror without re-probing.
 		await Promise.all(Array.from({ length: CONFIG.POOL_SIZE }, () => this._createPage()));
 
 		// Warm all pages concurrently in the background (don't block init return)
@@ -169,16 +141,6 @@ class PuppeteerService {
 		if (!this.browser) throw new Error('Browser not initialized');
 
 		const page = await this.browser.newPage();
-
-		// Authenticate proxy credentials on every new page.
-		// This is the correct way — Chromium ignores creds in --proxy-server.
-		if (this.proxyConfig) {
-			await page.authenticate({
-				username: this.proxyConfig.username,
-				password: this.proxyConfig.password,
-			});
-			logger.debug({ server: this.proxyConfig.server }, 'Proxy auth set on page');
-		}
 
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
@@ -235,15 +197,6 @@ class PuppeteerService {
 	}
 
 	// ─── CF Warmup ────────────────────────────────────────────────────────────
-	//
-	// KEY CHANGE: CF navigation happens here — once, upfront — not per-request.
-	//
-	// After _warmPage() resolves, the page holds a valid cf_clearance cookie and
-	// is parked on the mirror's origin. Every XHR fired from that page will
-	// automatically carry the clearance. No navigation needed at request time.
-	//
-	// A refresh timer re-runs this every CF_REFRESH_INTERVAL_MS so the clearance
-	// never expires while the service is running.
 
 	private async _warmAllPages(): Promise<void> {
 		await Promise.all(this.pool.map((p) => this._warmPage(p)));
@@ -260,6 +213,8 @@ class PuppeteerService {
 		}
 
 		try {
+			// findCleanMirror uses the pre-ranked list from discoverMirrors()
+			// so it navigates to the fastest known-good mirror immediately
 			const origin = await mirrorRouter.findCleanMirror(pooled.page, CONFIG.CF_SOLVE_TIMEOUT_MS);
 			pooled.activeMirror = origin;
 			logger.info({ origin }, 'Page warmed — CF clearance acquired');
@@ -504,7 +459,6 @@ class PuppeteerService {
 			initialized: this.initialized,
 			heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
 			mirrors: mirrorRouter.getStats(),
-			proxy: this.proxyConfig ? this.proxyConfig.server : 'none',
 		};
 	}
 
@@ -549,6 +503,9 @@ class PuppeteerService {
 
 			await this.browser?.close().catch(() => {});
 			this.browser = null;
+
+			// Re-discover mirrors before restarting — topology may have changed
+			await mirrorRouter.discoverMirrors().catch((err) => logger.warn({ err }, 'Mirror re-discovery failed on browser restart'));
 
 			await this.init().catch((err) => logger.error({ err }, 'Browser restart failed'));
 			logger.info('Browser restarted');

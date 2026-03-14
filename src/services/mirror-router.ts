@@ -51,7 +51,6 @@ async function isPageBlockedByCF(page: Page): Promise<boolean> {
 				!!document.getElementById('cf-wrapper') ||
 				!!document.getElementById('challenge-form'),
 		}));
-
 		if (hasCFDom) return true;
 		const haystack = `${title} ${bodyText}`.toLowerCase();
 		return CF_SIGNALS_LOWER.some((s) => haystack.includes(s));
@@ -81,35 +80,39 @@ function backoffMs(failCount: number): number {
 	return Math.min(BASE_BACKOFF_MS * 2 ** (failCount - 1), MAX_BACKOFF_MS);
 }
 
-// ─── Fast HTTP reachability pre-check ─────────────────────────────────────────
+// ─── Reachability pre-check (pure Node fetch, no Puppeteer) ──────────────────
 //
-// Before spending 25s on a Puppeteer navigation, do a cheap Node.js fetch to
-// see if the host responds at all. On Railway (datacenter IP), unreachable hosts
-// fail in <3s via ECONNREFUSED/ENOTFOUND instead of burning the full timeout.
+// Used at startup to rank mirrors before any browser page exists.
+// Runs all mirrors in parallel — completes in ~2-3s instead of 16 × 25s.
 //
-// Results:
-//   'reachable'   → 2xx/3xx/404 response — host is up, proceed to Puppeteer
-//   'cf-blocked'  → 403/503 response — CF is answering, proceed to Puppeteer
-//   'unreachable' → timeout / DNS fail / ECONNREFUSED — skip immediately
+// Returns latency in ms so we can sort fastest-first, giving Puppeteer
+// the best mirror to navigate to immediately.
 
 const REACH_TIMEOUT_MS = 5_000;
 
-async function checkReachable(origin: string): Promise<'reachable' | 'unreachable' | 'cf-blocked'> {
+interface ReachResult {
+	origin: string;
+	reachable: boolean;
+	latencyMs: number;
+}
+
+async function probeOrigin(origin: string): Promise<ReachResult> {
+	const start = Date.now();
 	try {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), REACH_TIMEOUT_MS);
-
 		const res = await fetch(`${origin}/`, {
 			method: 'HEAD',
 			signal: controller.signal,
 			redirect: 'manual',
 		}).finally(() => clearTimeout(timer));
 
-		if (res.status === 403 || res.status === 503) return 'cf-blocked';
-		return 'reachable';
-	} catch (err) {
-		logger.debug({ origin, err: (err as Error).message }, 'Reachability pre-check failed');
-		return 'unreachable';
+		const latencyMs = Date.now() - start;
+		// 403/503 = CF is answering (reachable), 2xx/3xx = clean, 404 = up but no root
+		const reachable = res.status < 600;
+		return { origin, reachable, latencyMs };
+	} catch {
+		return { origin, reachable: false, latencyMs: REACH_TIMEOUT_MS };
 	}
 }
 
@@ -117,17 +120,65 @@ async function checkReachable(origin: string): Promise<'reachable' | 'unreachabl
 
 export class MirrorRouter {
 	private readonly mirrors: Map<string, MirrorState>;
+	// Ordered list of reachable mirrors, fastest first — set at startup
+	private _rankedMirrors: string[] = [];
+	private _startupDone = false;
 
 	constructor(mirrors: readonly string[] = STAKE_MIRRORS) {
 		this.mirrors = new Map(mirrors.map((origin) => [origin, { origin, status: 'unknown', lastChecked: 0, blockedUntil: 0, failCount: 0 }]));
+	}
+
+	// ─── Startup discovery ────────────────────────────────────────────────────
+	//
+	// Call this once at server startup, before launching Puppeteer.
+	// Probes all mirrors in parallel via cheap HTTP HEAD requests and builds
+	// a ranked list (fastest-first, unreachable excluded).
+	//
+	// After this runs, findCleanMirror skips the probe phase entirely and
+	// navigates Puppeteer directly to the top-ranked mirror.
+
+	async discoverMirrors(): Promise<void> {
+		const allOrigins = [...this.mirrors.keys()];
+		logger.info({ count: allOrigins.length }, 'Probing mirrors at startup...');
+
+		const results = await Promise.all(allOrigins.map(probeOrigin));
+
+		const reachable = results.filter((r) => r.reachable).sort((a, b) => a.latencyMs - b.latencyMs);
+
+		const unreachable = results.filter((r) => !r.reachable);
+
+		// Pre-mark unreachable ones so they sit in backoff immediately
+		for (const { origin } of unreachable) {
+			this.markUnreachable(origin);
+		}
+
+		this._rankedMirrors = reachable.map((r) => r.origin);
+		this._startupDone = true;
+
+		logger.info(
+			{
+				reachable: reachable.map((r) => `${r.origin} (${r.latencyMs}ms)`),
+				unreachable: unreachable.map((r) => r.origin),
+			},
+			`Mirror discovery complete — ${reachable.length} reachable, ${unreachable.length} unreachable`,
+		);
 	}
 
 	// ─── Selection ────────────────────────────────────────────────────────────
 
 	getAvailableMirrors(): string[] {
 		const now = Date.now();
-		const rank = (s: MirrorStatus) => (s === 'healthy' ? 0 : s === 'unknown' ? 1 : 2);
 
+		if (this._startupDone && this._rankedMirrors.length > 0) {
+			// Use pre-ranked list — filters out anything that's since been blocked/unreachable
+			return this._rankedMirrors.filter((origin) => {
+				const s = this.mirrors.get(origin);
+				return s && now >= s.blockedUntil;
+			});
+		}
+
+		// Fallback: startup hasn't run yet, use default sort
+		const rank = (s: MirrorStatus) => (s === 'healthy' ? 0 : s === 'unknown' ? 1 : 2);
 		return [...this.mirrors.values()]
 			.filter((m) => now >= m.blockedUntil)
 			.sort((a, b) => rank(a.status) - rank(b.status))
@@ -143,6 +194,9 @@ export class MirrorRouter {
 		s.failCount = 0;
 		s.blockedUntil = 0;
 		s.lastChecked = Date.now();
+
+		// Promote to front of ranked list so future pages use it immediately
+		this._rankedMirrors = [origin, ...this._rankedMirrors.filter((o) => o !== origin)];
 	}
 
 	markBlocked(origin: string): void {
@@ -152,6 +206,8 @@ export class MirrorRouter {
 		s.status = 'blocked';
 		s.blockedUntil = Date.now() + backoffMs(s.failCount);
 		s.lastChecked = Date.now();
+		// Remove from ranked list — it'll re-appear after blockedUntil via getAvailableMirrors filter
+		this._rankedMirrors = this._rankedMirrors.filter((o) => o !== origin);
 		logger.warn({ origin, failCount: s.failCount, cooldownMs: backoffMs(s.failCount) }, 'Mirror CF-blocked');
 	}
 
@@ -162,6 +218,7 @@ export class MirrorRouter {
 		s.status = 'unreachable';
 		s.blockedUntil = Date.now() + backoffMs(s.failCount);
 		s.lastChecked = Date.now();
+		this._rankedMirrors = this._rankedMirrors.filter((o) => o !== origin);
 		logger.warn({ origin, failCount: s.failCount }, 'Mirror unreachable');
 	}
 
@@ -173,65 +230,20 @@ export class MirrorRouter {
 		return out;
 	}
 
-	// ─── CF Bypass ────────────────────────────────────────────────────────────
+	// ─── CF Bypass (Puppeteer) ────────────────────────────────────────────────
+	//
+	// After discoverMirrors() has run, this skips the parallel probe phase
+	// and navigates directly to the top-ranked reachable mirror.
+	// On a warm server, this saves 2-5s per page warmup.
 
-	/**
-	 * Two-phase mirror selection:
-	 *
-	 * Phase 1 — parallel cheap reachability checks via Node fetch (5s timeout each).
-	 *   Filters out network-unreachable mirrors instantly without tying up Puppeteer.
-	 *   On Railway/datacenter IPs, this eliminates all unreachable mirrors in ~5s
-	 *   instead of hanging 16 × 25s = 400s.
-	 *
-	 * Phase 2 — sequential Puppeteer navigation only on hosts confirmed reachable.
-	 *   Uses networkidle2 so the CF clearance XHR completes before we proceed.
-	 */
 	async findCleanMirror(page: Page, timeout = 25_000): Promise<string> {
 		const available = this.getAvailableMirrors();
 
 		if (available.length === 0) {
-			throw new Error('All mirrors are on cooldown');
+			throw new Error('All mirrors are on cooldown — no reachable mirrors available');
 		}
 
-		// ── Phase 1: parallel reachability pre-check ───────────────────────────
-		logger.debug({ count: available.length }, 'Running parallel reachability pre-check');
-
-		const reachResults = await Promise.all(available.map(async (origin) => ({ origin, reach: await checkReachable(origin) })));
-
-		const reachableMirrors: string[] = [];
-		for (const { origin, reach } of reachResults) {
-			if (reach === 'unreachable') {
-				this.markUnreachable(origin);
-			} else {
-				reachableMirrors.push(origin);
-			}
-		}
-
-		logger.info(
-			{
-				total: available.length,
-				reachable: reachableMirrors.length,
-				unreachable: available.length - reachableMirrors.length,
-			},
-			'Reachability pre-check complete',
-		);
-
-		if (reachableMirrors.length === 0) {
-			// This is almost always a datacenter IP issue, not a CF issue.
-			// Stealth plugins cannot fix IP-level blocks.
-			logger.error(
-				{
-					hint: 'Set RESIDENTIAL_PROXY_URL=http://user:pass@host:port (Webshare, Oxylabs, Bright Data, Smartproxy)',
-				},
-				'All mirrors are network-unreachable — datacenter IP block detected. Residential proxy required.',
-			);
-			throw new Error(
-				'All mirrors are network-unreachable from this server. ' + 'A residential proxy is required — set RESIDENTIAL_PROXY_URL.',
-			);
-		}
-
-		// ── Phase 2: Puppeteer navigation on reachable mirrors only ───────────
-		for (const origin of reachableMirrors) {
+		for (const origin of available) {
 			const result = await this._tryMirror(page, origin, timeout);
 
 			if (result === 'clean') {
@@ -243,7 +255,7 @@ export class MirrorRouter {
 			result === 'blocked' ? this.markBlocked(origin) : this.markUnreachable(origin);
 		}
 
-		throw new Error(`All ${reachableMirrors.length} reachable mirrors are CF-blocked`);
+		throw new Error(`All ${available.length} mirrors are CF-blocked or unreachable`);
 	}
 
 	private async _tryMirror(page: Page, origin: string, timeout: number): Promise<'clean' | 'blocked' | 'unreachable'> {
@@ -259,7 +271,7 @@ export class MirrorRouter {
 
 			const blocked = await isPageBlockedByCF(page);
 			if (blocked) {
-				logger.warn({ origin, elapsed: Date.now() - solveStart }, 'CF challenge did not resolve within timeout');
+				logger.warn({ origin, elapsed: Date.now() - solveStart }, 'CF challenge did not resolve');
 				return 'blocked';
 			}
 
@@ -267,9 +279,7 @@ export class MirrorRouter {
 			return 'clean';
 		} catch (err) {
 			const msg = (err as Error).message ?? '';
-			if (msg.includes('timeout') || msg.includes('Timeout')) {
-				return 'blocked';
-			}
+			if (msg.includes('timeout') || msg.includes('Timeout')) return 'blocked';
 			return 'unreachable';
 		}
 	}
