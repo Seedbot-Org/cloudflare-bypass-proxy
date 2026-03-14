@@ -29,13 +29,29 @@ const CONFIG = {
 
 	// Timeout for the initial CF solve during warmup / forced refresh
 	CF_SOLVE_TIMEOUT_MS: 25_000,
-
 	REQUEST_TIMEOUT_MS: 15_000,
 	QUEUE_TIMEOUT_MS: 30_000,
 	HEALTH_CHECK_INTERVAL_MS: 60_000,
 	HEAP_RECYCLE_THRESHOLD_MB: 400,
 	BROWSER_RESTART_DELAY_MS: 1_000,
 } as const;
+
+// ─── Proxy config ─────────────────────────────────────────────────────────────
+interface ProxyConfig {
+	server: string; // host:port  — passed to --proxy-server
+	username: string;
+	password: string;
+}
+
+function parseProxyUrl(raw: string): ProxyConfig {
+	try {
+		const url = new URL(raw);
+		const server = `${url.hostname}:${url.port}`;
+		return { server, username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) };
+	} catch {
+		throw new Error(`Invalid RESIDENTIAL_PROXY_URL: "${raw}". Expected format: http://user:pass@host:port`);
+	}
+}
 
 interface PooledPage {
 	page: Page;
@@ -66,6 +82,7 @@ class PuppeteerService {
 	private shuttingDown = false;
 	private healthTimer: NodeJS.Timeout | null = null;
 	private restartTimer: NodeJS.Timeout | null = null;
+	private proxyConfig: ProxyConfig | null = null;
 
 	// ─── Init ─────────────────────────────────────────────────────────────────
 
@@ -86,14 +103,22 @@ class PuppeteerService {
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
 		puppeteerExtra.default.use(StealthPlugin.default());
 
+		// Parse proxy — fail loudly at startup rather than silently failing later
 		const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
-		const proxyArgs = proxyUrl ? [`--proxy-server=${proxyUrl}`] : [];
-
 		if (proxyUrl) {
-			logger.info({ proxy: proxyUrl.replace(/:([^:@]+)@/, ':***@') }, 'Using residential proxy');
+			this.proxyConfig = parseProxyUrl(proxyUrl);
+			logger.info({ server: this.proxyConfig.server, username: this.proxyConfig.username }, 'Residential proxy configured');
 		} else {
-			logger.warn('No RESIDENTIAL_PROXY_URL — datacenter IP may be blocked by Cloudflare');
+			logger.warn(
+				'No RESIDENTIAL_PROXY_URL set. ' +
+					'Railway/Render/Fly datacenter IPs are blocked by Cloudflare. ' +
+					'Set RESIDENTIAL_PROXY_URL=http://user:pass@host:port',
+			);
 		}
+
+		const proxyArgs = this.proxyConfig
+			? [`--proxy-server=${this.proxyConfig.server}`] // host:port only — NO credentials here
+			: [];
 
 		this.browser = await puppeteerExtra.default.launch({
 			headless: true,
@@ -144,6 +169,16 @@ class PuppeteerService {
 		if (!this.browser) throw new Error('Browser not initialized');
 
 		const page = await this.browser.newPage();
+
+		// Authenticate proxy credentials on every new page.
+		// This is the correct way — Chromium ignores creds in --proxy-server.
+		if (this.proxyConfig) {
+			await page.authenticate({
+				username: this.proxyConfig.username,
+				password: this.proxyConfig.password,
+			});
+			logger.debug({ server: this.proxyConfig.server }, 'Proxy auth set on page');
+		}
 
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
@@ -215,7 +250,7 @@ class PuppeteerService {
 	}
 
 	private async _warmPage(pooled: PooledPage): Promise<void> {
-		if (pooled.warming) return; // prevent concurrent warm on same page
+		if (pooled.warming) return;
 		pooled.warming = true;
 
 		// Cancel existing refresh timer before re-warming
@@ -231,7 +266,7 @@ class PuppeteerService {
 
 			// Schedule proactive refresh before clearance expires
 			pooled.refreshTimer = setTimeout(() => {
-				this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Background CF refresh failed — will retry on next request if needed'));
+				this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Background CF refresh failed'));
 			}, CONFIG.CF_REFRESH_INTERVAL_MS);
 			pooled.refreshTimer.unref();
 		} catch (err) {
@@ -243,9 +278,7 @@ class PuppeteerService {
 	}
 
 	private _isHealthy(p: PooledPage): boolean {
-		return (
-			Date.now() - p.createdAt <= CONFIG.PAGE_MAX_AGE_MS && p.requestCount < CONFIG.MAX_REQUESTS_PER_PAGE && p.activeMirror !== null // not warmed = not healthy for requests
-		);
+		return Date.now() - p.createdAt <= CONFIG.PAGE_MAX_AGE_MS && p.requestCount < CONFIG.MAX_REQUESTS_PER_PAGE && p.activeMirror !== null;
 	}
 
 	private async _recyclePage(pooled: PooledPage): Promise<void> {
@@ -279,7 +312,7 @@ class PuppeteerService {
 		// If a page is warming, wait for it rather than navigating again
 		const warming = this.pool.find((p) => !p.busy && p.warming);
 		if (warming) {
-			logger.debug('Waiting for page warmup to complete...');
+			logger.debug('Waiting for page warmup...');
 			await this._waitForWarm(warming);
 			if (warming.activeMirror) {
 				warming.busy = true;
@@ -292,10 +325,7 @@ class PuppeteerService {
 		if (stale) {
 			await this._recyclePage(stale);
 			const fresh = this.pool[this.pool.length - 1];
-			// Wait for fresh page warmup
-			if (!fresh.activeMirror) {
-				await this._waitForWarm(fresh);
-			}
+			if (!fresh.activeMirror) await this._waitForWarm(fresh);
 			fresh.busy = true;
 			return fresh;
 		}
@@ -324,7 +354,6 @@ class PuppeteerService {
 				if (idx !== -1) this.queue.splice(idx, 1);
 				reject(new Error('Request timed out in queue'));
 			}, CONFIG.QUEUE_TIMEOUT_MS);
-
 			this.queue.push({ request, resolve, reject, timeoutId });
 		});
 	}
@@ -422,7 +451,7 @@ class PuppeteerService {
 		// Trigger a background re-warm and return error so the caller can retry.
 		if (result.status === 403 || result.status === 503) {
 			const origin = new URL(request.url).origin;
-			logger.warn({ status: result.status, origin }, 'CF block — triggering background re-warm');
+			logger.warn({ status: result.status, origin }, 'CF block mid-session — triggering re-warm');
 			mirrorRouter.markBlocked(origin);
 			pooled.activeMirror = null;
 			// Re-warm in background; don't block the response
@@ -475,6 +504,7 @@ class PuppeteerService {
 			initialized: this.initialized,
 			heapMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
 			mirrors: mirrorRouter.getStats(),
+			proxy: this.proxyConfig ? this.proxyConfig.server : 'none',
 		};
 	}
 
