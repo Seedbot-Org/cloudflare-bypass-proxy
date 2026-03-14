@@ -6,6 +6,8 @@ import { config } from './config';
 import { logger } from './logger';
 import { proxyRouter } from './routes/proxy.routes';
 import { healthRouter } from './routes/health.routes';
+import { mirrorRouter } from './services/mirror-router';
+import { puppeteerService } from './services/puppeteer.service';
 
 const app = express();
 
@@ -30,7 +32,17 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
 	res.status(500).json({ success: false, error: err.message });
 });
 
-app.listen(config.PORT, () => {
-	logger.info(`Cloudflare Bypass Proxy running on port ${config.PORT}`);
-	logger.info('Using Puppeteer with stealth mode');
+async function start() {
+	await mirrorRouter.discoverMirrors();
+
+	puppeteerService.init().catch((err) => logger.error({ err }, 'Puppeteer init failed'));
+
+	app.listen(config.PORT, () => {
+		logger.info(`Proxy running on port ${config.PORT}`);
+	});
+}
+
+start().catch((err) => {
+	logger.error({ err }, 'Server failed to start');
+	process.exit(1);
 });
