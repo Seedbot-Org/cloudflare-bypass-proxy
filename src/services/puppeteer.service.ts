@@ -19,21 +19,16 @@ export interface ProxyResponse {
 }
 
 const CONFIG = {
-	POOL_SIZE: 3,
-	MAX_REQUESTS_PER_PAGE: 200,
-	PAGE_MAX_AGE_MS: 20 * 60_000, // 20 min
-
-	// CF clearance TTL is ~5 min. Refresh at 3.5 min to stay safely ahead.
-	// This runs in the background — zero impact on request latency.
-	CF_REFRESH_INTERVAL_MS: 3.5 * 60_000,
-
-	// Timeout for the initial CF solve during warmup / forced refresh
+	POOL_SIZE: 1,
+	MAX_REQUESTS_PER_PAGE: 100,
+	PAGE_MAX_AGE_MS: 10 * 60_000,
+	CF_REFRESH_INTERVAL_MS: 3 * 60_000,
 	CF_SOLVE_TIMEOUT_MS: 25_000,
 	REQUEST_TIMEOUT_MS: 15_000,
 	QUEUE_TIMEOUT_MS: 30_000,
 	HEALTH_CHECK_INTERVAL_MS: 60_000,
-	HEAP_RECYCLE_THRESHOLD_MB: 400,
-	BROWSER_RESTART_DELAY_MS: 1_000,
+	HEAP_RECYCLE_THRESHOLD_MB: 250,
+	BROWSER_RESTART_DELAY_MS: 2_000,
 } as const;
 
 interface PooledPage {
@@ -41,11 +36,8 @@ interface PooledPage {
 	busy: boolean;
 	requestCount: number;
 	createdAt: number;
-	// The mirror this page currently holds clearance for (null = not warmed up)
 	activeMirror: string | null;
-	// Whether this page is currently being warmed up (prevents double-warm races)
 	warming: boolean;
-	// Timer that proactively refreshes CF clearance before it expires
 	refreshTimer: NodeJS.Timeout | null;
 }
 
@@ -63,6 +55,7 @@ class PuppeteerService {
 	private initialized = false;
 	private initPromise: Promise<void> | null = null;
 	private shuttingDown = false;
+	private restarting = false;
 	private healthTimer: NodeJS.Timeout | null = null;
 	private restartTimer: NodeJS.Timeout | null = null;
 
@@ -79,15 +72,6 @@ class PuppeteerService {
 	}
 
 	private async _init(): Promise<void> {
-		logger.info('Starting up...');
-
-		// Probe all mirrors in parallel via cheap HTTP (no browser needed).
-		// This runs BEFORE launching Puppeteer so by the time pages are created,
-		// mirrorRouter already knows which mirrors are reachable and their latency rank.
-		// Each subsequent _warmPage() navigates directly to the top mirror — no probing.
-		await mirrorRouter.discoverMirrors();
-
-		// Launch browser
 		logger.info('Launching Puppeteer...');
 		const puppeteerExtra = await import('puppeteer-extra');
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
@@ -95,7 +79,6 @@ class PuppeteerService {
 
 		this.browser = await puppeteerExtra.default.launch({
 			headless: true,
-			executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
 			args: [
 				'--no-sandbox',
 				'--disable-setuid-sandbox',
@@ -109,27 +92,31 @@ class PuppeteerService {
 				'--mute-audio',
 				'--no-first-run',
 				'--window-size=1280,720',
-				'--js-flags=--max-old-space-size=128',
+				'--js-flags=--max-old-space-size=96',
 				'--disable-blink-features=AutomationControlled',
 				'--disable-features=IsolateOrigins,site-per-process',
+				'--disable-crash-reporter',
+				'--disable-logging',
+				'--disable-in-process-stack-traces',
+				'--log-level=3',
+				'--silent-debugger-extension-api',
+				'--aggressive-cache-discard',
+				'--disable-application-cache',
+				'--media-cache-size=0',
+				'--disk-cache-size=0',
 			],
 		});
 
+		// Only restart on unexpected disconnects — not when we close() deliberately
 		this.browser.on('disconnected', () => {
-			if (!this.shuttingDown) {
-				logger.warn('Browser disconnected — restarting');
-				this._restartBrowser();
+			if (!this.shuttingDown && !this.restarting) {
+				logger.warn('Browser disconnected unexpectedly — scheduling restart');
+				this._scheduleRestart();
 			}
 		});
 
-		// Create pages and warm them all in parallel.
-		// Because discoverMirrors() already ranked mirrors, each _warmPage()
-		// goes straight to the best mirror without re-probing.
 		await Promise.all(Array.from({ length: CONFIG.POOL_SIZE }, () => this._createPage()));
-
-		// Warm all pages concurrently in the background (don't block init return)
 		this._warmAllPages().catch((err) => logger.error({ err }, 'Initial warmup failed'));
-
 		this._startHealthCheck();
 		this.initialized = true;
 		logger.info(`Puppeteer ready (pool: ${CONFIG.POOL_SIZE}) — warming pages in background`);
@@ -145,7 +132,7 @@ class PuppeteerService {
 		await page.setRequestInterception(true);
 		page.on('request', (req) => {
 			const type = req.resourceType();
-			if (['document', 'script', 'xhr', 'fetch', 'stylesheet'].includes(type)) {
+			if (['document', 'script', 'xhr', 'fetch'].includes(type)) {
 				req.continue();
 			} else {
 				req.abort();
@@ -206,20 +193,16 @@ class PuppeteerService {
 		if (pooled.warming) return;
 		pooled.warming = true;
 
-		// Cancel existing refresh timer before re-warming
 		if (pooled.refreshTimer) {
 			clearTimeout(pooled.refreshTimer);
 			pooled.refreshTimer = null;
 		}
 
 		try {
-			// findCleanMirror uses the pre-ranked list from discoverMirrors()
-			// so it navigates to the fastest known-good mirror immediately
 			const origin = await mirrorRouter.findCleanMirror(pooled.page, CONFIG.CF_SOLVE_TIMEOUT_MS);
 			pooled.activeMirror = origin;
 			logger.info({ origin }, 'Page warmed — CF clearance acquired');
 
-			// Schedule proactive refresh before clearance expires
 			pooled.refreshTimer = setTimeout(() => {
 				this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Background CF refresh failed'));
 			}, CONFIG.CF_REFRESH_INTERVAL_MS);
@@ -250,32 +233,28 @@ class PuppeteerService {
 		await pooled.page.close().catch(() => {});
 
 		const fresh = await this._createPage();
-		// Warm the new page in background — don't hold up the recycle
 		this._warmPage(fresh).catch((err) => logger.warn({ err }, 'Recycled page warmup failed'));
 	}
 
 	private async _acquirePage(): Promise<PooledPage> {
 		await this.init();
 
-		// Prefer a warm, healthy, free page
 		const ready = this.pool.find((p) => !p.busy && !p.warming && this._isHealthy(p));
 		if (ready) {
 			ready.busy = true;
 			return ready;
 		}
 
-		// If a page is warming, wait for it rather than navigating again
 		const warming = this.pool.find((p) => !p.busy && p.warming);
 		if (warming) {
 			logger.debug('Waiting for page warmup...');
 			await this._waitForWarm(warming);
-			if (warming.activeMirror) {
+			if (this._isHealthy(warming)) {
 				warming.busy = true;
 				return warming;
 			}
 		}
 
-		// Stale but free — recycle + warm, then use it
 		const stale = this.pool.find((p) => !p.busy);
 		if (stale) {
 			await this._recyclePage(stale);
@@ -334,8 +313,6 @@ class PuppeteerService {
 	private async _executeRequest(pooled: PooledPage, request: GraphQLRequest): Promise<ProxyResponse> {
 		const start = Date.now();
 
-		// Rewrite the URL to the mirror this page has clearance for.
-		// No navigation — the page is already parked on the mirror.
 		if (pooled.activeMirror) {
 			const originalOrigin = new URL(request.url).origin;
 			if (originalOrigin !== pooled.activeMirror) {
@@ -349,7 +326,7 @@ class PuppeteerService {
 			const result = await Promise.race([
 				this._cdpFetch(pooled, request),
 				new Promise<ProxyResponse>((_, reject) =>
-					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS),
+					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS)
 				),
 			]);
 			return { ...result, timing: { duration: Date.now() - start } };
@@ -399,17 +376,14 @@ class PuppeteerService {
 					xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out' });
 					xhr.send(body);
 				}),
-			{ url: request.url, headers, body },
+			{ url: request.url, headers, body }
 		);
 
-		// CF blocked mid-session — clearance expired sooner than expected.
-		// Trigger a background re-warm and return error so the caller can retry.
 		if (result.status === 403 || result.status === 503) {
 			const origin = new URL(request.url).origin;
 			logger.warn({ status: result.status, origin }, 'CF block mid-session — triggering re-warm');
 			mirrorRouter.markBlocked(origin);
 			pooled.activeMirror = null;
-			// Re-warm in background; don't block the response
 			this._warmPage(pooled).catch((err) => logger.warn({ err }, 'Re-warm after CF block failed'));
 		} else if (result.success) {
 			mirrorRouter.markHealthy(new URL(request.url).origin);
@@ -483,42 +457,55 @@ class PuppeteerService {
 
 	// ─── Crash Recovery ───────────────────────────────────────────────────────
 
-	private _restartBrowser(): void {
+	private _scheduleRestart(): void {
 		if (this.restartTimer) return;
-		this.restartTimer = setTimeout(async () => {
+		this.restartTimer = setTimeout(() => {
 			this.restartTimer = null;
-			this.initialized = false;
-			this.initPromise = null;
-
-			for (const item of this.queue.splice(0)) {
-				clearTimeout(item.timeoutId);
-				item.reject(new Error('Browser crashed'));
-			}
-
-			// Clear refresh timers before nuking pool
-			for (const p of this.pool) {
-				if (p.refreshTimer) clearTimeout(p.refreshTimer);
-			}
-			this.pool = [];
-
-			await this.browser?.close().catch(() => {});
-			this.browser = null;
-
-			// Re-discover mirrors before restarting — topology may have changed
-			await mirrorRouter.discoverMirrors().catch((err) => logger.warn({ err }, 'Mirror re-discovery failed on browser restart'));
-
-			await this.init().catch((err) => logger.error({ err }, 'Browser restart failed'));
-			logger.info('Browser restarted');
+			this._doRestart().catch((err) => logger.error({ err }, 'Browser restart failed permanently'));
 		}, CONFIG.BROWSER_RESTART_DELAY_MS);
+		this.restartTimer.unref();
+	}
 
-		this.restartTimer?.unref?.();
+	private async _doRestart(): Promise<void> {
+		logger.info('Restarting browser...');
+		this.restarting = true;
+		this.initialized = false;
+		this.initPromise = null;
+
+		for (const item of this.queue.splice(0)) {
+			clearTimeout(item.timeoutId);
+			item.reject(new Error('Browser crashed — request dropped'));
+		}
+
+		for (const p of this.pool) {
+			if (p.refreshTimer) clearTimeout(p.refreshTimer);
+		}
+		this.pool = [];
+
+		await this.browser?.close().catch(() => {});
+		this.browser = null;
+
+		await mirrorRouter.discoverMirrors().catch((err) => logger.warn({ err }, 'Mirror re-discovery failed — will use cached ranking'));
+
+		try {
+			await this._init();
+			logger.info('Browser restarted successfully');
+		} catch (err) {
+			logger.error({ err }, 'Browser failed to restart — will retry in 10s');
+			setTimeout(() => this._doRestart(), 10_000).unref();
+		} finally {
+			this.restarting = false;
+		}
 	}
 
 	// ─── Shutdown ─────────────────────────────────────────────────────────────
 
 	async close(): Promise<void> {
+		if (this.shuttingDown) return;
 		this.shuttingDown = true;
+		logger.info('Shutting down PuppeteerService...');
 
+		// Stop all background timers first so nothing fires during teardown
 		if (this.healthTimer) {
 			clearInterval(this.healthTimer);
 			this.healthTimer = null;
@@ -528,20 +515,27 @@ class PuppeteerService {
 			this.restartTimer = null;
 		}
 
+		// Cancel all refresh timers on pooled pages
+		for (const p of this.pool) {
+			if (p.refreshTimer) {
+				clearTimeout(p.refreshTimer);
+				p.refreshTimer = null;
+			}
+		}
+
+		// Reject all queued requests immediately
 		for (const item of this.queue.splice(0)) {
 			clearTimeout(item.timeoutId);
 			item.reject(new Error('Service shutting down'));
 		}
 
-		for (const p of this.pool) {
-			if (p.refreshTimer) clearTimeout(p.refreshTimer);
-		}
-
 		await Promise.allSettled(this.pool.map((p) => p.page.close()));
 		this.pool = [];
 
+		// Now close the browser — all pages are already gone so it exits cleanly
 		await this.browser?.close().catch(() => {});
 		this.browser = null;
+
 		this.initialized = false;
 		this.initPromise = null;
 
@@ -550,10 +544,3 @@ class PuppeteerService {
 }
 
 export const puppeteerService = new PuppeteerService();
-
-const shutdown = async () => {
-	await puppeteerService.close();
-	process.exit(0);
-};
-process.once('SIGINT', shutdown);
-process.once('SIGTERM', shutdown);
