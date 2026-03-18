@@ -20,9 +20,9 @@ export interface ProxyResponse {
 
 const CONFIG = {
 	POOL_SIZE: 1,
-	MAX_REQUESTS_PER_PAGE: 100,
-	PAGE_MAX_AGE_MS: 10 * 60_000,
-	CF_REFRESH_INTERVAL_MS: 3 * 60_000,
+	MAX_REQUESTS_PER_PAGE: 500,
+	PAGE_MAX_AGE_MS: 30 * 60_000,
+	CF_REFRESH_INTERVAL_MS: 14 * 60_000,
 	CF_SOLVE_TIMEOUT_MS: 25_000,
 	REQUEST_TIMEOUT_MS: 15_000,
 	QUEUE_TIMEOUT_MS: 30_000,
@@ -58,6 +58,7 @@ class PuppeteerService {
 	private restarting = false;
 	private healthTimer: NodeJS.Timeout | null = null;
 	private restartTimer: NodeJS.Timeout | null = null;
+	private pluginAdded = false;
 
 	// ─── Init ─────────────────────────────────────────────────────────────────
 
@@ -75,7 +76,10 @@ class PuppeteerService {
 		logger.info('Launching Puppeteer...');
 		const puppeteerExtra = await import('puppeteer-extra');
 		const StealthPlugin = await import('puppeteer-extra-plugin-stealth');
-		puppeteerExtra.default.use(StealthPlugin.default());
+		if (!this.pluginAdded) {
+			puppeteerExtra.default.use(StealthPlugin.default());
+			this.pluginAdded = true;
+		}
 
 		this.browser = await puppeteerExtra.default.launch({
 			headless: true,
@@ -212,6 +216,7 @@ class PuppeteerService {
 			pooled.activeMirror = null;
 		} finally {
 			pooled.warming = false;
+			this._drainQueue();
 		}
 	}
 
@@ -322,13 +327,13 @@ class PuppeteerService {
 
 		pooled.requestCount++;
 
+		let timeoutId: NodeJS.Timeout | undefined;
 		try {
-			const result = await Promise.race([
-				this._cdpFetch(pooled, request),
-				new Promise<ProxyResponse>((_, reject) =>
-					setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS)
-				),
-			]);
+			const timeoutPromise = new Promise<ProxyResponse>((_, reject) => {
+				timeoutId = setTimeout(() => reject(new Error(`Timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)), CONFIG.REQUEST_TIMEOUT_MS);
+			});
+
+			const result = await Promise.race([this._cdpFetch(pooled, request), timeoutPromise]);
 			return { ...result, timing: { duration: Date.now() - start } };
 		} catch (err) {
 			const msg = (err as Error).message ?? '';
@@ -336,6 +341,8 @@ class PuppeteerService {
 				throw new Error('Page closed during request — browser may have crashed');
 			}
 			throw err;
+		} finally {
+			if (timeoutId) clearTimeout(timeoutId);
 		}
 	}
 
@@ -376,7 +383,7 @@ class PuppeteerService {
 					xhr.ontimeout = () => resolve({ success: false, error: 'XHR timed out' });
 					xhr.send(body);
 				}),
-			{ url: request.url, headers, body }
+			{ url: request.url, headers, body },
 		);
 
 		if (result.status === 403 || result.status === 503) {
