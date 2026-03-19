@@ -47,16 +47,25 @@ class PuppeteerService {
         try {
             logger.info('Launching browser via puppeteer-real-browser...');
 
+            const chromePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+            if (chromePath) {
+                logger.info({ chromePath }, 'Using custom Chrome executable path');
+            }
+
             const { browser, page } = await connect({
                 headless: false,
                 turnstile: true,
-                disableXvfb: false,
+                // We start Xvfb ourselves in the Docker CMD before the process
+                // starts, so disable the npm xvfb package to avoid conflicts.
+                disableXvfb: true,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
+                    '--disable-gpu',
                     '--window-size=1920,1080',
                 ],
+                ...(chromePath ? { customConfig: { chromePath } } : {}),
             });
 
             this.browser = browser;

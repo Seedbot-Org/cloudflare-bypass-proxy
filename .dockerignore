@@ -1,0 +1,7 @@
+node_modules
+dist
+.env
+.env.*
+*.log
+*.bak
+src/services/puppeteer.service.ts.bak

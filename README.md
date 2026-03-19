@@ -1,10 +1,10 @@
 # Cloudflare Bypass Proxy
 
-A lightweight proxy service that uses Puppeteer with stealth mode to bypass Cloudflare protection, providing a simple REST API.
+A lightweight proxy service that uses [puppeteer-real-browser](https://github.com/zfcsoftware/puppeteer-real-browser) to bypass Cloudflare Turnstile protection, providing a simple REST API.
 
 ## Features
 
-- Simple REST API for proxying requests through FlareSolverr
+- Bypasses Cloudflare Turnstile automatically
 - GraphQL endpoint for APIs like Stake
 - Built-in Stake bet lookup endpoint
 - Optional API key authentication
@@ -12,22 +12,49 @@ A lightweight proxy service that uses Puppeteer with stealth mode to bypass Clou
 
 ## Quick Start
 
-### Manual Setup
+### Docker (recommended)
 
-1. Install dependencies, build, and run the proxy:
+> **Apple Silicon (M1/M2/M3):** add `--platform linux/amd64` to both commands below.
+
+**Build the image:**
 
 ```bash
-pnpm install
-pnpm run build
-pnpm start
+docker build -t cf-proxy .
 ```
 
-### Development
+**Run the container:**
+
+```bash
+docker run --rm -p 3003:3003 \
+  -e PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+  cf-proxy
+```
+
+**With optional API key auth:**
+
+```bash
+docker run --rm -p 3003:3003 \
+  -e PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+  -e API_KEY=your-secret-key \
+  cf-proxy
+```
+
+The service will be available at `http://localhost:3003`.
+
+> **Note:** The first request will take 10–30 seconds while the browser launches and solves the Cloudflare challenge. Subsequent requests reuse the session and are much faster.
+
+---
+
+### Manual Setup (local development)
 
 ```bash
 pnpm install
 pnpm dev
 ```
+
+Chrome must be installed locally and `PUPPETEER_EXECUTABLE_PATH` must point to it, or Puppeteer will download its own Chromium.
+
+---
 
 ## API Endpoints
 
@@ -35,22 +62,6 @@ pnpm dev
 
 ```bash
 GET /health
-GET /health/flaresolverr
-```
-
-### Generic Proxy
-
-```bash
-POST /api/proxy
-Content-Type: application/json
-
-{
-  "url": "https://example.com",
-  "method": "GET",
-  "headers": {},
-  "body": {},
-  "timeout": 60000
-}
 ```
 
 ### GraphQL Proxy
@@ -78,27 +89,51 @@ Content-Type: application/json
 }
 ```
 
+**Example:**
+
+```bash
+curl -X POST http://localhost:3003/api/proxy/stake/bet \
+  -H "Content-Type: application/json" \
+  -d '{"betId": "house:456499839614"}'
+```
+
+---
+
 ## Configuration
 
-| Variable           | Default                  | Description                            |
-| ------------------ | ------------------------ | -------------------------------------- |
-| `PORT`             | 3002                     | Server port                            |
-| `FLARESOLVERR_URL` | http://localhost:8191/v1 | FlareSolverr endpoint                  |
-| `CORS_ORIGINS`     | \*                       | Allowed CORS origins (comma-separated) |
-| `REQUEST_TIMEOUT`  | 60000                    | Request timeout in ms                  |
-| `MAX_TIMEOUT`      | 120000                   | Max timeout in ms                      |
-| `API_KEY`          | (empty)                  | Optional API key for auth              |
+| Variable                    | Default   | Description                                    |
+| --------------------------- | --------- | ---------------------------------------------- |
+| `PORT`                      | `3003`    | Server port                                    |
+| `PUPPETEER_EXECUTABLE_PATH` | _(auto)_  | Path to Chrome binary                          |
+| `CORS_ORIGINS`              | `*`       | Allowed CORS origins (comma-separated)         |
+| `REQUEST_TIMEOUT`           | `60000`   | Request timeout in ms                          |
+| `API_KEY`                   | _(empty)_ | Optional API key for auth (`x-api-key` header) |
+
+---
+
+## Deploying to Railway
+
+Railway will auto-detect the `Dockerfile` and build it automatically.
+
+**Required environment variables in Railway dashboard:**
+
+| Variable                    | Value                           |
+| --------------------------- | ------------------------------- |
+| `PUPPETEER_EXECUTABLE_PATH` | `/usr/bin/google-chrome-stable` |
+| `PORT`                      | `3003`                          |
+
+> Allocate at least **1 GB RAM** to the Railway service — Chrome is memory-heavy.
+
+---
 
 ## Usage in seedbot-backend
 
-Update your `StakeVerifier` to call this proxy instead of ScraperAPI:
-
 ```typescript
-const response = await fetch("http://localhost:3002/api/proxy/stake/bet", {
+const response = await fetch("http://localhost:3003/api/proxy/stake/bet", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    // 'x-api-key': 'your-api-key', // If API_KEY is set
+    // "x-api-key": "your-secret-key", // if API_KEY is set
   },
   body: JSON.stringify({ betId: "house:123456789" }),
 });
