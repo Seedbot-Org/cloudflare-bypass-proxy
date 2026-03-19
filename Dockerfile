@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM --platform=linux/amd64 node:20-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 # Xvfb virtual display — puppeteer-real-browser needs a real display to pass Cloudflare
@@ -42,8 +42,9 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libxtst6 \
     lsb-release \
-    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
