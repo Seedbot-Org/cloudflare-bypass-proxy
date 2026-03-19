@@ -22,7 +22,8 @@
     "pino-pretty": "^10.3.1",
     "puppeteer": "^24.38.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer-real-browser": "^1.4.4"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
@@ -30,6 +31,5 @@
     "@types/node": "^20.10.6",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
-  },
-  "packageManager": "pnpm@10.17.1+sha1.b312886439096718a402117aa3f375c4e3be5ed8"
+  }
 }
