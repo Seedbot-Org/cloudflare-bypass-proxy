@@ -1,69 +1,56 @@
-FROM --platform=linux/amd64 node:20-bookworm-slim
+FROM node:20-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Xvfb virtual display — puppeteer-real-browser needs a real display to pass Cloudflare
 ENV DISPLAY=:99
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
-# Install Google Chrome (stable) + Xvfb + all required system libs
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    ca-certificates \
     xvfb \
-    # Chrome system dependencies
+    x11-utils \
+    chromium \
     fonts-liberation \
+    fonts-noto-color-emoji \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
-    libcairo2 \
     libcups2 \
     libdbus-1-3 \
     libdrm2 \
-    libexpat1 \
-    libfontconfig1 \
     libgbm1 \
-    libglib2.0-0 \
     libgtk-3-0 \
     libnspr4 \
     libnss3 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libx11-6 \
     libx11-xcb1 \
-    libxcb1 \
     libxcomposite1 \
-    libxcursor1 \
     libxdamage1 \
-    libxext6 \
     libxfixes3 \
-    libxi6 \
     libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    lsb-release \
-    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-        | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+    libxshmfence1 \
+    wget \
+    ca-certificates \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install pnpm
 RUN npm install -g pnpm
 
 WORKDIR /app
 
-# Install dependencies (allow all build scripts so native addons compile)
+# Install dependencies
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --ignore-scripts=false
+RUN pnpm install --frozen-lockfile
 
 # Copy source and build
 COPY . .
 RUN pnpm build
 
+# Tell puppeteer-real-browser where Chromium is
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 EXPOSE 3003
 
-# Start Xvfb virtual display first, then the app.
-# Xvfb must be running before Chrome launches.
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & sleep 2 && node dist/index.js"]
+# Use entrypoint that waits for Xvfb to be ready before starting Node
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]
